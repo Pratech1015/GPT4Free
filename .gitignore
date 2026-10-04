@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+gptpp/.chatgpt_credentials.json
+gptpp/.chatgpt_browser_state.json
+gptpp/.chatgpt_conversations.json
