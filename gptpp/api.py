@@ -27,7 +27,7 @@ from typing import Any, AsyncGenerator, Optional
 import aiohttp
 
 from .errors import AttachmentError, AuthError, SentinelError, UpstreamError
-from .mweb import MwebChatClient, flatten_messages
+from .mweb import MwebChatClient, apply_system_prompt, flatten_messages
 from .sentinel import ChatRequirements, USER_AGENT as SENTINEL_UA, get_chat_requirements
 
 CREDENTIALS_FILE = os.path.join(os.path.dirname(__file__), ".chatgpt_credentials.json")
@@ -77,6 +77,7 @@ class ChatGptApiClient:
         logged_in: bool = False,
         browser_fallback: bool = False,
         mweb_fallback: bool = True,
+        system_prompt: str = "",
         session: Optional[aiohttp.ClientSession] = None,
     ):
         self.token = token
@@ -86,6 +87,9 @@ class ChatGptApiClient:
         self.logged_in = logged_in
         self.browser_fallback = browser_fallback
         self.mweb_fallback = mweb_fallback
+        self.system_prompt = system_prompt
+        self._system_state = ""    # instructions already delivered this conversation
+        self._system_applied = ""  # what the text built for the current turn carries
 
         self._session = session
         self._own_session = session is None
@@ -390,6 +394,8 @@ class ChatGptApiClient:
         self._chat_id = None
         self._parent_msg_id = None
         self._history = []
+        self._system_state = ""
+        self._system_applied = ""
 
     @property
     def conversation_id(self) -> Optional[str]:
@@ -424,17 +430,44 @@ class ChatGptApiClient:
         return parts
 
     @staticmethod
-    def _flatten(messages: list) -> str:
+    def _flatten(messages: list, system_prompt: str = "") -> str:
         """Transcript-style prompt for a brand new conversation."""
-        return flatten_messages(messages)
+        return flatten_messages(messages, system_prompt=system_prompt)
 
-    def _outgoing_text(self, messages: list, pin: bool) -> str:
+    def resolve_system(self, system: Optional[str] = None) -> str:
+        """Per-call override wins over the client default; `""` disables."""
+        raw = self.system_prompt if system is None else system
+        return (raw or "").strip()
+
+    def _outgoing_text(self, messages: list, pin: bool, system: Optional[str] = None) -> str:
+        """
+        Text that goes out for this turn.
+
+        Fresh conversations flatten the transcript (instructions included);
+        pinned turns send only the newest message, so the instructions ride
+        along just once per conversation - or again after they change.
+        `self._system_applied` records what this text carried; `_do_stream`
+        commits it to `_system_state` only once the turn succeeds.
+        """
+        effective = self.resolve_system(system)
+        self._system_applied = self._system_state
         if not pin:
-            return self._flatten(messages)
+            text = self._flatten(messages, system_prompt=effective)
+            has_explicit = any(
+                m.get("role") in ("system", "developer") for m in messages
+            )
+            if effective and not has_explicit:
+                self._system_applied = effective
+            return text
+        text = "Hello"
         for msg in reversed(messages):
             if msg.get("role") == "user":
-                return self._content_text(msg.get("content", "")) or "Hello"
-        return "Hello"
+                text = self._content_text(msg.get("content", "")) or "Hello"
+                break
+        if effective and self._system_state != effective:
+            text = apply_system_prompt(text, effective)
+            self._system_applied = effective
+        return text
 
     async def upload_attachment(self, source, filename: Optional[str] = None) -> dict:
         """
@@ -553,7 +586,7 @@ class ChatGptApiClient:
         """(url, payload) for POST /backend-api/conversation."""
         opts = opts or {}
         pin = bool(self._chat_id and self._parent_msg_id)
-        text = self._outgoing_text(messages, pin=pin)
+        text = self._outgoing_text(messages, pin=pin, system=opts.get("system"))
         parent_id = self._parent_msg_id or str(uuid.uuid4())
 
         attachment_parts: list = []
@@ -711,7 +744,11 @@ class ChatGptApiClient:
                     done = True
                     break
                 if frame.get("conversation_id"):
-                    self._chat_id = str(frame["conversation_id"])
+                    frame_chat = str(frame["conversation_id"])
+                    if frame_chat != self._chat_id:
+                        self._chat_id = frame_chat
+                        # a new conversation id starts the instructions over
+                        self._system_state = ""
 
                 message = frame.get("message")
                 if not isinstance(message, dict):
@@ -754,7 +791,8 @@ class ChatGptApiClient:
             pass
         self._parent_msg_id = last_message_id
 
-    async def _mweb_stream(self, messages: list, timeout: float) -> AsyncGenerator[str, None]:
+    async def _mweb_stream(self, messages: list, timeout: float,
+                            system: Optional[str] = None) -> AsyncGenerator[str, None]:
         """Replay through the anonymous `/unauth-mweb` flow (pure HTTP)."""
         if self._mweb is None:
             self._mweb = MwebChatClient()
@@ -763,6 +801,9 @@ class ChatGptApiClient:
             # a different /backend-api chat id starts a fresh mweb conversation
             self._mweb.new_conversation()
             self._mweb_chat_id = self._chat_id
+        effective = self.resolve_system(system)
+        if any(m.get("role") in ("system", "developer") for m in messages):
+            effective = ""  # explicit system turns travel inside the flatten
         if self._mweb.conversation_state.get("userMessageCount"):
             # the mweb conversation already holds the earlier turns - only the
             # newest message goes over the wire
@@ -770,8 +811,10 @@ class ChatGptApiClient:
         else:
             text = ""
         if not text:
-            text = self._flatten(messages)
-        async for chunk in self._mweb.send_message_stream(text, timeout=max(timeout, 180)):
+            text = self._flatten(messages, system_prompt=effective)
+        async for chunk in self._mweb.send_message_stream(
+            text, timeout=max(timeout, 180), system=effective
+        ):
             if chunk:
                 yield chunk
 
@@ -782,7 +825,7 @@ class ChatGptApiClient:
             from .client import ChatGptClient
             self._browser = ChatGptClient(headless=True)
             await self._browser.start()
-        text = self._outgoing_text(messages, pin=False)
+        text = self._outgoing_text(messages, pin=False, system=opts.get("system"))
         async for chunk in self._browser.send_message_stream(text, timeout=180):
             if chunk:
                 yield chunk
@@ -796,6 +839,8 @@ class ChatGptApiClient:
         if chat_id is not None and chat_id != self._chat_id:
             self._chat_id = chat_id
             self._parent_msg_id = None
+            self._system_state = ""
+            self._system_applied = ""
         if self._chat_id and self._parent_msg_id is None:
             self._parent_msg_id = await self._fetch_leaf(self._chat_id)
 
@@ -810,6 +855,7 @@ class ChatGptApiClient:
                 async for phase, delta in self._stream_once(messages, timeout, model, opts):
                     if phase == "answer":
                         yield delta
+                self._system_state = self._system_applied
                 return
             except SentinelError as e:
                 last_error = e
@@ -859,7 +905,9 @@ class ChatGptApiClient:
                     self._mweb_notice = True
                     print("[api] backend-api unavailable - replaying over pure-HTTP "
                           "/unauth-mweb", flush=True)
-                async for chunk in self._mweb_stream(messages, timeout):
+                async for chunk in self._mweb_stream(
+                    messages, timeout, system=opts.get("system")
+                ):
                     yield chunk
                 return
             except (AuthError, UpstreamError, SentinelError) as e:
@@ -894,6 +942,7 @@ class ChatGptApiClient:
         deep_think: bool = True,
         reasoning_effort: Optional[str] = None,
         attachments: Optional[list] = None,
+        system: Optional[str] = None,
     ) -> AsyncGenerator[str, None]:
         if use_history and self._history and self._history[-1] == {"role": "user", "content": message}:
             messages = list(self._history)
@@ -906,6 +955,7 @@ class ChatGptApiClient:
             "deep_think": bool(deep_think),
             "reasoning_effort": reasoning_effort,
             "attachments": list(attachments or []),
+            "system": system,
         }
         async for chunk in self._do_stream(messages, timeout, chat_id=chat_id, model=model, opts=opts):
             yield chunk
@@ -920,13 +970,14 @@ class ChatGptApiClient:
         deep_think: bool = True,
         reasoning_effort: Optional[str] = None,
         attachments: Optional[list] = None,
+        system: Optional[str] = None,
     ) -> str:
         self._history.append({"role": "user", "content": message})
         chunks = []
         async for chunk in self.send_message_stream(
             message, timeout, chat_id=chat_id, model=model, web_search=web_search,
             deep_think=deep_think, reasoning_effort=reasoning_effort,
-            attachments=attachments,
+            attachments=attachments, system=system,
         ):
             chunks.append(chunk)
         reply = "".join(chunks)
@@ -944,12 +995,14 @@ class ChatGptApiClient:
         deep_think: bool = True,
         reasoning_effort: Optional[str] = None,
         attachments: Optional[list] = None,
+        system: Optional[str] = None,
     ) -> AsyncGenerator[str, None]:
         opts = {
             "web_search": bool(web_search),
             "deep_think": bool(deep_think),
             "reasoning_effort": reasoning_effort,
             "attachments": list(attachments or []),
+            "system": system,
         }
         async for chunk in self._do_stream(messages, timeout, chat_id=chat_id, model=model, opts=opts):
             yield chunk
@@ -964,12 +1017,13 @@ class ChatGptApiClient:
         deep_think: bool = True,
         reasoning_effort: Optional[str] = None,
         attachments: Optional[list] = None,
+        system: Optional[str] = None,
     ) -> str:
         chunks = []
         async for chunk in self.send_messages_stream(
             messages, timeout, chat_id=chat_id, model=model, web_search=web_search,
             deep_think=deep_think, reasoning_effort=reasoning_effort,
-            attachments=attachments,
+            attachments=attachments, system=system,
         ):
             chunks.append(chunk)
         reply = "".join(chunks)
@@ -988,6 +1042,7 @@ class ChatGptApiClient:
         deep_think: bool = True,
         reasoning_effort: Optional[str] = None,
         attachments: Optional[list] = None,
+        system: Optional[str] = None,
     ) -> dict:
         """Buffered call returning {"thinking": ..., "response": ...}."""
         messages = [*self._history, {"role": "user", "content": message}]
@@ -996,6 +1051,7 @@ class ChatGptApiClient:
             "deep_think": bool(deep_think),
             "reasoning_effort": reasoning_effort,
             "attachments": list(attachments or []),
+            "system": system,
         }
         thinking: list[str] = []
         answer: list[str] = []
@@ -1003,6 +1059,8 @@ class ChatGptApiClient:
         if chat_id is not None and chat_id != self._chat_id:
             self._chat_id = chat_id
             self._parent_msg_id = None
+            self._system_state = ""
+            self._system_applied = ""
         if self._chat_id and self._parent_msg_id is None:
             self._parent_msg_id = await self._fetch_leaf(self._chat_id)
 
@@ -1027,6 +1085,7 @@ class ChatGptApiClient:
         else:
             raise SentinelError("chatgpt.com sentinel enforcement kept rejecting the request")
 
+        self._system_state = self._system_applied
         self._history.append({"role": "user", "content": message})
         if answer:
             self._history.append({"role": "assistant", "content": "".join(answer)})

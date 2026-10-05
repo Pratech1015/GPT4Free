@@ -32,6 +32,8 @@ from typing import AsyncGenerator, List, Optional
 
 from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 
+from .mweb import apply_system_prompt
+
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".chatgpt_browser_state.json")
 
 FIREFOX_UA = "Mozilla/5.0 (X11; Linux x86_64; rv:141.0) Gecko/20100101 Firefox/141.0"
@@ -210,17 +212,48 @@ class ChatMessage:
 
 
 class ChatGptClient:
-    def __init__(self, headless: bool = True, stall_timeout: float = 8.0):
+    def __init__(
+        self,
+        headless: bool = True,
+        stall_timeout: float = 8.0,
+        system_prompt: str = "",
+    ):
         self.headless = headless
         self.stall_timeout = stall_timeout
+        self.system_prompt = system_prompt
+        self._system_state = ""    # instructions already sent this conversation
+        self._system_applied = ""  # what the text built for the current turn carries
         self._pending_cid = ""
         self.browser: Optional[Browser] = None
         self.context: Optional[BrowserContext] = None
         self.page: Optional[Page] = None
         self._playwright = None
 
+    def resolve_system(self, system: Optional[str] = None) -> str:
+        """Per-call override wins over the client default; `""` disables."""
+        raw = self.system_prompt if system is None else system
+        return (raw or "").strip()
+
+    def _apply_system(self, message: str, system: Optional[str] = None) -> str:
+        """
+        Attach standing instructions to the outgoing prompt.
+
+        Sent on the first turn and again whenever the instructions change -
+        earlier turns stay in the page, so repeating them would be noise.
+        `_system_applied` records what this text carries; `_stream_internal`
+        commits it to `_system_state` once the message is actually typed.
+        """
+        effective = self.resolve_system(system)
+        self._system_applied = self._system_state
+        if effective and self._system_state != effective:
+            message = apply_system_prompt(message, effective)
+            self._system_applied = effective
+        return message
+
     async def start(self) -> None:
         await self.close()
+        self._system_state = ""    # a fresh page starts a fresh conversation
+        self._system_applied = ""
         self._playwright = await async_playwright().start()
         self.browser = await self._playwright.firefox.launch(
             headless=self.headless,
@@ -417,6 +450,7 @@ class ChatGptClient:
         message: str,
         timeout: float = 180,
         include_thinking: bool = False,
+        system: Optional[str] = None,
     ) -> AsyncGenerator[tuple[str, str], None]:
         """
         Send `message` and yield (phase, delta) with phase in
@@ -424,6 +458,8 @@ class ChatGptClient:
         """
         if not self.page:
             raise RuntimeError("Client not started. Call start() first.")
+
+        message = self._apply_system(message, system)
 
         await self._reset_state()
         self._pending_cid = ""
@@ -441,6 +477,7 @@ class ChatGptClient:
         thinking = st0.get("thinking", "") or st0.get("sse_thinking", "")
 
         await self._type_and_send(message)
+        self._system_state = self._system_applied
 
         started = time.time()
         last_change = time.time()
@@ -555,18 +592,24 @@ class ChatGptClient:
     # ------------------------------------------------------------------
     # public API
     # ------------------------------------------------------------------
-    async def send_message(self, message: str, timeout: float = 180) -> str:
+    async def send_message(
+        self, message: str, timeout: float = 180, system: Optional[str] = None
+    ) -> str:
         parts = [
-            delta async for phase, delta in self._stream_internal(message, timeout)
+            delta async for phase, delta in self._stream_internal(message, timeout, system=system)
             if phase == "answer"
         ]
         return "".join(parts)
 
-    async def send_message_full(self, message: str, timeout: float = 180) -> dict:
+    async def send_message_full(
+        self, message: str, timeout: float = 180, system: Optional[str] = None
+    ) -> dict:
         thinking: List[str] = []
         answer: List[str] = []
         self._pending_cid = ""
-        async for phase, delta in self._stream_internal(message, timeout, include_thinking=True):
+        async for phase, delta in self._stream_internal(
+            message, timeout, include_thinking=True, system=system
+        ):
             (thinking if phase == "thinking" else answer).append(delta)
         return {
             "thinking": "".join(thinking),
@@ -579,18 +622,23 @@ class ChatGptClient:
         message: str,
         timeout: float = 180,
         include_thinking: bool = False,
+        system: Optional[str] = None,
     ) -> AsyncGenerator[str, None]:
         """Yield answer deltas (or 'thinking:'/'answer:' prefixed deltas)."""
-        async for phase, delta in self._stream_internal(message, timeout, include_thinking=include_thinking):
+        async for phase, delta in self._stream_internal(
+            message, timeout, include_thinking=include_thinking, system=system
+        ):
             if not delta:
                 continue
             yield (f"{phase}:{delta}") if include_thinking else delta
 
     async def send_message_stream_full(
-        self, message: str, timeout: float = 180
+        self, message: str, timeout: float = 180, system: Optional[str] = None
     ) -> AsyncGenerator[tuple[str, str], None]:
         """Stream (phase, delta) tuples - phase is 'thinking' or 'answer'."""
-        async for item in self._stream_internal(message, timeout, include_thinking=True):
+        async for item in self._stream_internal(
+            message, timeout, include_thinking=True, system=system
+        ):
             yield item
 
     def conversation_id(self) -> Optional[str]:
@@ -687,15 +735,48 @@ class ChatGptClient:
         await self.close()
 
 
-async def _browser_repl(timeout: float = 180) -> None:
+def _system_command(line: str, target) -> bool:
+    """
+    Handle `/system` inside a REPL.
+
+    `/system` shows the standing instructions, `/system <text>` sets them
+    (applies from the next turn), `/system clear` removes them. `target` is
+    anything with a `system_prompt` attribute. Returns True when handled.
+    """
+    if not line.startswith("/system"):
+        return False
+    arg = line[len("/system"):].strip()
+    if not arg:
+        print(f"[system] {(getattr(target, 'system_prompt', '') or '').strip() or '(none)'}")
+    elif arg.lower() in ("clear", "off", "none"):
+        target.system_prompt = ""
+        print("[system] cleared - it stays in the conversation already sent")
+    else:
+        target.system_prompt = arg
+        print(f"[system] {arg}")
+    return True
+
+
+def _system_banner(system: str) -> str:
+    system = (system or "").strip()
+    if not system:
+        return ""
+    shown = system if len(system) <= 70 else system[:67] + "..."
+    return f"System: {shown}"
+
+
+async def _browser_repl(timeout: float = 180, system: str = "") -> None:
     """Interactive chat driven by Playwright Firefox."""
-    client = ChatGptClient(headless=True)
+    client = ChatGptClient(headless=True, system_prompt=system)
     try:
         await client.start()
         await client.wait_for_auth()
 
         print("\n" + "=" * 60)
         print("CHAT STARTED (browser) - Type 'quit' to exit")
+        banner = _system_banner(system)
+        if banner:
+            print(banner)
         print("=" * 60)
 
         while True:
@@ -705,6 +786,8 @@ async def _browser_repl(timeout: float = 180) -> None:
                     continue
                 if user_input.lower() in ("quit", "exit", "q"):
                     break
+                if _system_command(user_input, client):
+                    continue
                 if user_input.lower() in ("new", "reset"):
                     print("[conversation reset only works in the pure-HTTP REPL]")
                     continue
@@ -735,15 +818,18 @@ async def _browser_repl(timeout: float = 180) -> None:
         await client.close()
 
 
-async def _http_repl(timeout: float = 180) -> None:
+async def _http_repl(timeout: float = 180, system: str = "") -> None:
     """Interactive chat over plain HTTP - no Playwright, no login."""
     from .errors import GptError
     from .mweb import MwebChatClient
 
-    client = MwebChatClient()
+    client = MwebChatClient(system_prompt=system)
     await client.open()
     print("\n" + "=" * 60)
     print("CHAT STARTED (pure HTTP) - 'new' resets, 'quit' exits")
+    banner = _system_banner(system)
+    if banner:
+        print(banner)
     print("=" * 60)
     try:
         while True:
@@ -753,6 +839,8 @@ async def _http_repl(timeout: float = 180) -> None:
                     continue
                 if user_input.lower() in ("quit", "exit", "q"):
                     break
+                if _system_command(user_input, client):
+                    continue
                 if user_input.lower() in ("new", "reset"):
                     client.new_conversation()
                     print("[conversation reset]")
@@ -793,11 +881,32 @@ async def main(argv: Optional[List[str]] = None) -> None:
         default=180,
         help="per-turn timeout in seconds (default: 180)",
     )
+    parser.add_argument(
+        "--system",
+        default="",
+        metavar="TEXT",
+        help="standing system prompt/instructions for the conversation",
+    )
+    parser.add_argument(
+        "--system-file",
+        default="",
+        metavar="PATH",
+        help="read the system prompt from a file (wins over --system)",
+    )
     args = parser.parse_args(argv)
+
+    system = args.system or ""
+    if args.system_file:
+        try:
+            with open(args.system_file, "r", encoding="utf-8") as fh:
+                system = fh.read().strip()
+        except OSError as exc:
+            parser.error(f"cannot read --system-file: {exc}")
+
     if args.browser:
-        await _browser_repl(args.timeout)
+        await _browser_repl(args.timeout, system)
     else:
-        await _http_repl(args.timeout)
+        await _http_repl(args.timeout, system)
 
 
 if __name__ == "__main__":

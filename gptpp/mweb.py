@@ -44,6 +44,7 @@ from .sentinel import (
     build_requirements_blob,
     solve_pow,
 )
+from .solver import solve_turnstile
 
 MW_URL = f"{BASE_URL}/unauth-mweb"
 UPDATES_URL = f"{MW_URL}/conversation/updates"
@@ -113,8 +114,33 @@ def _content_text(content) -> str:
     return str(content or "")
 
 
-def flatten_messages(messages: list) -> str:
-    """Transcript-style prompt for a brand-new conversation."""
+SYSTEM_PREFIX = "System instruction:"
+
+
+def apply_system_prompt(text: str, system_prompt: str) -> str:
+    """
+    Prepend standing instructions to a prompt.
+
+    chatgpt.com has no system role - both transports deliver instructions
+    in-band as a `System instruction:` header. Idempotent: text that already
+    carries the header is returned untouched.
+    """
+    prompt = (system_prompt or "").strip()
+    if not prompt:
+        return text
+    if text.lstrip().startswith(SYSTEM_PREFIX):
+        return text
+    return f"{SYSTEM_PREFIX} {prompt}\n\n{text}"
+
+
+def flatten_messages(messages: list, system_prompt: str = "") -> str:
+    """
+    Transcript-style prompt for a brand-new conversation.
+
+    `system`/`developer` turns become the `System instruction:` header; when
+    the list carries none, the caller's `system_prompt` fills that slot
+    (explicit system messages always win over the client default).
+    """
     chunks: list[str] = []
     system_bits: list[str] = []
     for msg in messages:
@@ -128,8 +154,9 @@ def flatten_messages(messages: list) -> str:
             label = "User" if role == "user" else "Assistant"
             chunks.append(f"{label}: {text}")
     out = ""
-    if system_bits:
-        out = "System instruction: " + "\n".join(system_bits) + "\n\n"
+    header = "\n".join(system_bits) or (system_prompt or "").strip()
+    if header:
+        out = f"{SYSTEM_PREFIX} {header}\n\n"
     if chunks:
         out += "\n".join(chunks) + "\n\nAssistant:"
     return out.strip() or "Hello"
@@ -434,10 +461,14 @@ class MwebChatClient:
         self,
         session: Optional[aiohttp.ClientSession] = None,
         profile: Optional[BrowserProfile] = None,
+        system_prompt: str = "",
     ):
         self._session = session
         self._own_session = session is None
         self._profile = profile or BrowserProfile()
+        self.system_prompt = system_prompt
+        self._system_state = ""    # instructions already delivered this conversation
+        self._system_applied = ""  # what the text built for the current turn carries
         self._session_id = str(uuid.uuid4())
         self._conv_state: dict = {
             "messages": [],
@@ -518,6 +549,34 @@ class MwebChatClient:
         }
         self._conversation_id = ""
         self._history = []
+        self._system_state = ""
+        self._system_applied = ""
+
+    # ------------------------------------------------------------------
+    # system prompt
+    # ------------------------------------------------------------------
+    def resolve_system(self, system: Optional[str] = None) -> str:
+        """Per-call override wins over the client default; `""` disables."""
+        raw = self.system_prompt if system is None else system
+        return (raw or "").strip()
+
+    def _prompt_with_system(self, message: str, system: str) -> str:
+        """
+        Attach standing instructions to the outgoing prompt.
+
+        Sent on the conversation's first turn and again whenever the
+        instructions change - the server keeps earlier turns in context, so
+        repeating them every turn would be noise. `send_message_stream`
+        commits `_system_applied` to `_system_state` once the turn lands.
+        """
+        self._system_applied = self._system_state
+        if not system:
+            return message
+        fresh = not int(self._conv_state.get("userMessageCount") or 0)
+        if fresh or self._system_state != system:
+            message = apply_system_prompt(message, system)
+            self._system_applied = system
+        return message
 
     # ------------------------------------------------------------------
     # transport helpers
@@ -562,17 +621,16 @@ class MwebChatClient:
     # ------------------------------------------------------------------
     # steps
     # ------------------------------------------------------------------
-    async def _sentinel(self) -> Tuple[str, str, str]:
+    async def _sentinel(self) -> Tuple[str, str, str, str]:
         """
         chat-requirements over plain HTTP.
 
-        Returns (token, prepare_token, proof_token) - all three land in the
-        updates form body.
+        Returns (token, prepare_token, proof_token, turnstile_token) - all
+        four land in the updates form body (turnstile also in finalize).
         """
         referer = f"{BASE_URL}/"
-        prepare = await self._post_json(
-            f"{SENTINEL_URL}/prepare", {"p": build_requirements_blob(self._profile)}, referer
-        )
+        p = build_requirements_blob(self._profile)
+        prepare = await self._post_json(f"{SENTINEL_URL}/prepare", {"p": p}, referer)
 
         body: dict = {"prepare_token": prepare.get("prepare_token", "")}
         proof = ""
@@ -592,17 +650,21 @@ class MwebChatClient:
             body["proofofwork"] = proof
 
         turnstile = prepare.get("turnstile") or {}
-        if turnstile.get("required") and not turnstile.get("dx"):
-            raise TurnstileRequiredError(
-                "chat-requirements requested a Turnstile challenge; "
-                "use `python -m gptpp.client --browser` (Playwright) instead"
-            )
+        turnstile_token = ""
+        if turnstile.get("required"):
+            dx = turnstile.get("dx")
+            if not dx:
+                raise TurnstileRequiredError(
+                    "chat-requirements requested a Turnstile challenge without a program"
+                )
+            turnstile_token = await solve_turnstile(p, dx)
+            body["turnstile"] = turnstile_token
 
         final = await self._post_json(f"{SENTINEL_URL}/finalize", body, referer)
         token = final.get("token") or ""
         if not token:
             raise UpstreamError("chat-requirements finalize returned no token")
-        return token, str(prepare.get("prepare_token") or ""), proof
+        return token, str(prepare.get("prepare_token") or ""), proof, turnstile_token
 
     async def _prepare(self, referer: str) -> str:
         session = await self._require_session()
@@ -664,7 +726,7 @@ class MwebChatClient:
             else f"{BASE_URL}/"
         )
 
-        requirements, prepare_token, proof = await self._sentinel()
+        requirements, prepare_token, proof, turnstile_token = await self._sentinel()
         conduit = await self._prepare(referer)
 
         form = self._form_fields()
@@ -677,7 +739,7 @@ class MwebChatClient:
                 "chatRequirementsToken": requirements,
                 "chatRequirementsPrepareToken": prepare_token,
                 "proofToken": proof,
-                "turnstileToken": "",
+                "turnstileToken": turnstile_token,
                 "telemetryToken": "",
                 "timingToken": "[1,null]",
                 "imageSaveData": "unknown",
@@ -764,15 +826,16 @@ class MwebChatClient:
     # public API
     # ------------------------------------------------------------------
     async def send_message_stream(
-        self, message: str, timeout: float = 180
+        self, message: str, timeout: float = 180, system: Optional[str] = None
     ) -> AsyncGenerator[str, None]:
         """Yield answer deltas for `message`, keeping the conversation alive."""
+        prompt = self._prompt_with_system(message, self.resolve_system(system))
         self._parser = None
         self._history.append({"role": "user", "content": message})
         answer = ""
         error: Optional[str] = None
         try:
-            async for event in self._stream_prompt(message, timeout):
+            async for event in self._stream_prompt(prompt, timeout):
                 if event["kind"] == "delta":
                     answer += event["delta"]
                     yield event["delta"]
@@ -786,26 +849,42 @@ class MwebChatClient:
         if final:
             self._history.append({"role": "assistant", "content": final})
             self._adopt_turn_state()
+            self._system_state = self._system_applied
         elif error:
             raise UpstreamError(error)
 
-    async def send_message(self, message: str, timeout: float = 180) -> str:
-        chunks = [c async for c in self.send_message_stream(message, timeout)]
+    async def send_message(
+        self, message: str, timeout: float = 180, system: Optional[str] = None
+    ) -> str:
+        chunks = [
+            c async for c in self.send_message_stream(message, timeout, system=system)
+        ]
         if self._parser is not None and self._parser.answer:
             return self._parser.answer
         return "".join(chunks)
 
     async def send_messages_stream(
-        self, messages: list, timeout: float = 180
+        self, messages: list, timeout: float = 180, system: Optional[str] = None
     ) -> AsyncGenerator[str, None]:
         """Replay a full OpenAI-style message list as one flattened prompt."""
-        async for delta in self.send_message_stream(flatten_messages(messages), timeout):
+        effective = self.resolve_system(system)
+        prompt = flatten_messages(messages, system_prompt=effective)
+        async for delta in self.send_message_stream(prompt, timeout, system=effective):
             yield delta
 
-    async def send_messages(self, messages: list, timeout: float = 180) -> str:
-        return "".join([c async for c in self.send_messages_stream(messages, timeout)])
+    async def send_messages(
+        self, messages: list, timeout: float = 180, system: Optional[str] = None
+    ) -> str:
+        chunks = [
+            c async for c in self.send_messages_stream(messages, timeout, system=system)
+        ]
+        if self._parser is not None and self._parser.answer:
+            return self._parser.answer
+        return "".join(chunks)
 
-    async def send_message_full(self, message: str, timeout: float = 180) -> dict:
+    async def send_message_full(
+        self, message: str, timeout: float = 180, system: Optional[str] = None
+    ) -> dict:
         """Buffered call - the mobile-web flow has no separate reasoning stream."""
-        reply = await self.send_message(message, timeout)
+        reply = await self.send_message(message, timeout, system=system)
         return {"thinking": "", "response": reply, "conversation_id": self._conversation_id}

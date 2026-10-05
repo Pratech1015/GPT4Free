@@ -16,8 +16,9 @@ language, random window/document keys, performance.now, sid, timeOrigin,
 feature flags ...). Slots 3 and 9 are overwritten by the attempt counter and
 elapsed ms while solving, exactly like `_runCheck()`.
 
-Turnstile challenges cannot be solved without a browser - callers get
-`TurnstileRequiredError` back from the client when enforcement demands one.
+Turnstile challenges are solved by `gptpp.solver` (the extracted challenge
+VM running on Node.js); `TurnstileRequiredError` surfaces only when the
+runtime or the solve itself fails.
 """
 
 from __future__ import annotations

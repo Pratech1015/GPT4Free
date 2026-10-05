@@ -14,9 +14,15 @@ or talk straight to the anonymous mobile-web endpoint (plain HTTP, no login):
     async with MwebChatClient() as client:
         print(await client.send_message("hello"))
 
-Dependencies: aiohttp (HTTP core), playwright (login + browser fallback).
+Every transport takes `system_prompt=` (per-call `system=` overrides it, `""`
+disables); chatgpt.com has no system role, so instructions travel in-band as
+a `System instruction:` header on the first turn of each conversation.
+
+Dependencies: aiohttp (HTTP core), node >= 18 (Turnstile solver),
+playwright (login + browser fallback).
 Run `python -m gptpp.login` once to capture a logged-in session; run
-`python -m gptpp.client` for the REPL (pure HTTP by default).
+`python -m gptpp.client` for the REPL (pure HTTP by default, `--system` for
+standing instructions).
 """
 
 from .errors import (
@@ -35,6 +41,7 @@ _LAZY = {
     "MwebChatClient": ("gptpp.mweb", "MwebChatClient"),
     "DpuParser": ("gptpp.mweb", "DpuParser"),
     "flatten_messages": ("gptpp.mweb", "flatten_messages"),
+    "apply_system_prompt": ("gptpp.mweb", "apply_system_prompt"),
     "ChatMessage": ("gptpp.client", "ChatMessage"),
     "ChatGptClient": ("gptpp.client", "ChatGptClient"),
     "ChatRequirements": ("gptpp.sentinel", "ChatRequirements"),

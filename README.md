@@ -19,6 +19,7 @@ Async chatgpt.com chat stack: three transports for the same `send_message*` API 
 
 * pure-HTTP `/backend-api` chatgpt.com client — chat-requirements prepare/finalize, FNV proof-of-work, SSE streaming, auto session refresh
 * pure-HTTP `/unauth-mweb` client (`gptpp/mweb.py`) — sentinel + conduit token + declarative-partial-update HTML stream, works anonymously with **zero login** (this is the automatic fallback transport)
+* Turnstile solver (`gptpp/solver.py` + `gptpp/turnstile.mjs`) — the extracted Sentinel challenge VM runs on Node.js with a Firefox-shaped environment, producing browser-compatible tokens
 * async Playwright browser client with in-page SSE interception **and** transcript DOM polling
 * `python -m gptpp.client` interactive REPL — pure HTTP by default, `--browser` for Playwright
 * login helper that sniffs the bearer token + cookies into `.chatgpt_credentials.json`
@@ -35,6 +36,8 @@ Async chatgpt.com chat stack: three transports for the same `send_message*` API 
 pip install -r requirements.txt
 playwright install firefox    # optional - only for python -m gptpp.login / --browser
 ```
+
+The anonymous `/unauth-mweb` transport solves the Cloudflare Turnstile challenge with a bundled JavaScript VM, so **Node.js >= 18** must be on `PATH`.
 
 Credentials are stored under `gptpp/` (gitignored).
 
@@ -62,7 +65,7 @@ async def main():
 asyncio.run(main())
 ```
 
-Or chat interactively (pure HTTP, `new` resets the conversation):
+Or chat interactively (pure HTTP, `new` resets the conversation, `--system "..."` sets standing instructions):
 
 ```bash
 python -m gptpp.client
@@ -125,6 +128,36 @@ reply = await client.send_message(
 
 > [!NOTE]
 > `model`, `web_search`, `deep_think`, `reasoning_effort`, and `attachments` live on `/backend-api` only — the anonymous mobile-web replay ignores them and answers with the default model.
+
+### System Prompt / Instructions
+
+chatgpt.com has no system role, so standing instructions travel in-band as a `System instruction:` header — sent on a conversation's first turn and again whenever you change them (not repeated every turn):
+
+```python
+client = ChatGptApiClient(system_prompt="Answer in pirate speak.")
+reply = await client.send_message("hi")     # instructions go out here
+reply = await client.send_message("...")    # later turns stay quiet
+
+# per-call override: None keeps the client default, "" sends none this call
+reply = await client.send_message("hi", system="Answer in riddles only.")
+```
+
+Every transport takes the same knob: `MwebChatClient(system_prompt=...)` (pure HTTP) and `ChatGptClient(system_prompt=...)` (browser). A `system`/`developer` role in a message list wins over the client default:
+
+```python
+reply = await client.send_messages([
+    {"role": "system", "content": "Answer only with PONG."},
+    {"role": "user", "content": "Ping"},
+])
+```
+
+In the REPL:
+
+```bash
+python -m gptpp.client --system "Answer in pirate speak."   # or --system-file notes.txt
+```
+
+`/system` shows the current instructions, `/system <text>` changes them (applies from the next turn), `/system clear` drops them.
 
 ---
 
@@ -205,10 +238,10 @@ Pure-HTTP async client: SSE parsing (`data:` frames, optional `{"v","p"}` envelo
 
 ### 3. Mobile-Web Layer (`mweb.py`)
 
-The anonymous `chatgpt.com` web app completes through `POST /unauth-mweb/conversation/updates`, which needs no login and no Turnstile. Per turn:
+The anonymous `chatgpt.com` web app completes through `POST /unauth-mweb/conversation/updates`, which needs no login. Per turn:
 
 1. warm-up `GET /` for first-party cookies (`__cf_bm`, `oai-did`, `oai-mweb-route` …)
-2. `/unauth-mweb/sentinel/chat-requirements/prepare` → local PoW → `/finalize`
+2. `/unauth-mweb/sentinel/chat-requirements/prepare` → local PoW → Turnstile VM (`gptpp/solver.py`) → `/finalize`
 3. `/unauth-mweb/conversation/prepare` → `conduit_token` (sent as `x-conduit-token`)
 4. the `updates` POST (form-encoded: `prompt`, `chatRequirementsToken`, `proofToken`, `conversationState`, `clientContextualInfo`, `assistantMessageId` …) answered with a stream of `<template data-web-mobile-dpu-frame>` frames
 
@@ -228,7 +261,7 @@ Playwright Firefox restores `.chatgpt_browser_state.json`, types into `#prompt-t
 > This project is experimental and based on reverse-engineered behavior of chatgpt.com. The API may change at any time, and use may violate OpenAI's terms of service. Use at your own risk.
 
 > [!NOTE]
-> `/backend-api/conversation` still answers 403 sentinel/turnstile enforcement from anonymous sessions (verified live). That is expected: `ChatGptApiClient` makes one attempt and then replays over `/unauth-mweb`, which needs neither login nor Turnstile. When you also want Playwright as a last resort, construct `ChatGptApiClient(browser_fallback=True)`.
+> `/backend-api/conversation` still answers 403 sentinel/turnstile enforcement from anonymous sessions (verified live). That is expected: `ChatGptApiClient` makes one attempt and then replays over `/unauth-mweb`, which needs neither login nor a browser — its Turnstile challenge is solved by the bundled Node.js VM. When you also want Playwright as a last resort, construct `ChatGptApiClient(browser_fallback=True)`.
 
 > [!NOTE]
 > The sentinel endpoints answer 401 until chatgpt.com has handed out its first-party cookies, so the client does a warm-up `GET /` before `chat-requirements/prepare` when you have no saved session (`api.py` and `mweb.py` both do this).
@@ -240,7 +273,7 @@ Playwright Firefox restores `.chatgpt_browser_state.json`, types into `#prompt-t
 > If requests start failing with 401, call `await client.refresh_session()` — it re-reads `/api/auth/session` with your saved cookies. Rerun `python -m gptpp.login` when the token fully expires.
 
 > [!TIP]
-> Conversation continuation: a pinned `chat_id` sends only your last message with `parent_message_id` set to the conversation's current leaf node. Without a pin, history is flattened into a single user message (`System instruction:` prefix for `system` turns).
+> Conversation continuation: a pinned `chat_id` sends only your last message with `parent_message_id` set to the conversation's current leaf node. Without a pin, history is flattened into a single user message (`System instruction:` prefix for `system` turns or a `system_prompt=`).
 
 ---
 
