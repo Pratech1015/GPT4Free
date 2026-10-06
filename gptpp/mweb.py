@@ -237,11 +237,14 @@ def strip_markup(fragment: str) -> str:
 _CITATION_RUN_RE = re.compile(
     r"[ \t]*\burl[^<>]*?turn\d+search\d+(?:[ \t]+url[^<>]*?turn\d+search\d+)*(?:[ \t]+url)?"
 )
+# dangling footer heading left behind after its chips were stripped as UI
+_SOURCES_HEADING_RE = re.compile(r"(?<![^.\s])Sources\s*:?\s*$")
 
 
 def _tidy_prose(text: str) -> str:
-    """Drop plain-text citation runs (`url<label>turn0searchN`)."""
-    return _CITATION_RUN_RE.sub("", text).rstrip()
+    """Drop citation runs and dangling sources-chrome from prose."""
+    text = _CITATION_RUN_RE.sub("", text)
+    return _SOURCES_HEADING_RE.sub("", text).rstrip()
 
 
 def extract_assistant_text(content: str) -> str:
@@ -594,7 +597,25 @@ class DpuParser:
             keys = self.group_keys[group]
             committed_keys = [k for k in keys if k in self.committed]
             if committed_keys:
-                out.extend(self.committed[k] for k in committed_keys)
+                # long answers commit incrementally: `committed-tail` appends
+                # each finalized chunk while `committed-block-N` directives
+                # re-send the same content per block - the tail alone is the
+                # complete message, so blocks only serve as fallback
+                tail_keys = [k for k in committed_keys
+                             if k.endswith("-committed-tail")]
+                if tail_keys:
+                    out.extend(self.committed[k] for k in tail_keys)
+                else:
+                    def block_no(key: str) -> int:
+                        suffix = key.rsplit("-", 1)[-1]
+                        return int(suffix) if suffix.isdigit() else -1
+                    block_keys = sorted(
+                        (k for k in committed_keys if block_no(k) >= 0),
+                        key=block_no,
+                    )
+                    out.extend(self.committed[k] for k in block_keys)
+                    out.extend(self.committed[k] for k in committed_keys
+                               if k not in block_keys)
                 continue
             pending_keys = [k for k in keys if k in self.pending]
             pending_keys.sort(key=lambda k: k.endswith("-pending-tail"))
