@@ -89,6 +89,58 @@ _ATTR_ANY_RE = re.compile(r'([a-zA-Z][\w-]*)="([^"]*)"')
 _DOC_CONTROL_RE = re.compile(
     r'data-conversation-control="([^"]+)"((?:\s+data-[a-z-]+="[^"]*")+)', re.I
 )
+_SOURCES_PAYLOAD_RE = re.compile(r'data-assistant-sources-payload="([^"]*)"')
+_SHIMMER_RE = re.compile(r'data-text-shimmer-text="([^"]*)"')
+
+# blocks that carry prose; interactive blocks (button footnotes, chips) do not
+_PROSE_TAGS = frozenset(
+    ("p", "li", "h1", "h2", "h3", "h4", "h5", "h6",
+     "blockquote", "pre", "td", "th", "figcaption", "dd", "dt")
+)
+_VOID_TAGS = frozenset(
+    ("img", "br", "hr", "input", "meta", "link", "source", "track", "wbr", "col", "area", "base", "embed")
+)
+# token scanner tolerant of `>` inside quoted attribute values (payload JSON)
+_TOKEN_RE = re.compile(r"<(/?)([a-zA-Z][\w-]*)((?:[^>\"']|\"[^\"]*\"|'[^']*')*)>", re.S)
+
+
+def _is_tool_node(tag: str, attrs: str) -> bool:
+    """Citation chips, grouped-webpage buttons, source footnotes."""
+    return (
+        "data-assistant-content-reference" in attrs
+        or "data-assistant-grouped-webpages" in attrs
+        or "data-assistant-sources-trigger" in attrs
+        or "data-assistant-sources-payload" in attrs
+        or tag == "button"
+    )
+
+
+def drop_tool_nodes(fragment: str) -> str:
+    """
+    Remove tool/citation UI subtrees (buttons and their wrapper spans) so
+    only prose text survives.
+    """
+    out: List[str] = []
+    skip: List[str] = []          # tag names of subtrees being skipped
+    pos = 0
+    for m in _TOKEN_RE.finditer(fragment):
+        if not skip:
+            out.append(fragment[pos:m.start()])
+        pos = m.end()
+        closing, tag, attrs = m.group(1), m.group(2).lower(), m.group(3)
+        self_close = m.group(0).rstrip().endswith("/>") or tag in _VOID_TAGS
+        if skip:
+            if closing:
+                if tag == skip[-1]:
+                    skip.pop()
+            elif not self_close:
+                skip.append(tag)
+        elif not closing and not self_close and _is_tool_node(tag, attrs):
+            skip.append(tag)
+    if not skip:
+        out.append(fragment[pos:])
+    return "".join(out)
+
 
 
 def _client_context() -> str:
@@ -182,14 +234,25 @@ def strip_markup(fragment: str) -> str:
     return text.strip("\n")
 
 
+_CITATION_RUN_RE = re.compile(
+    r"[ \t]*\burl[^<>]*?turn\d+search\d+(?:[ \t]+url[^<>]*?turn\d+search\d+)*(?:[ \t]+url)?"
+)
+
+
+def _tidy_prose(text: str) -> str:
+    """Drop plain-text citation runs (`url<label>turn0searchN`)."""
+    return _CITATION_RUN_RE.sub("", text).rstrip()
+
+
 def extract_assistant_text(content: str) -> str:
     """
-    Pull assistant text out of one DPU frame.
+    Pull assistant *prose* out of one DPU frame.
 
     Live/committed blocks arrive as `<tag data-assistant-stream-block-index="N">`
     elements (paragraphs, lists, headings); older frames carry a
-    `data-writing-block-source` JSON attribute instead. The stream markup is
-    preferred so streaming and committed frames stay textually identical.
+    `data-writing-block-source` JSON attribute instead. Tool UI (citation
+    chips, grouped-webpage buttons, source footnotes) and interactive blocks
+    are stripped so only the answer text survives.
     """
     if not content:
         return ""
@@ -197,8 +260,10 @@ def extract_assistant_text(content: str) -> str:
     if blocks:
         blocks.sort(key=lambda pair: int(pair[1]))
         parts = []
-        for _, _, inner in blocks:
-            text = strip_markup(inner)
+        for tag, _, inner in blocks:
+            if tag.lower() not in _PROSE_TAGS:
+                continue
+            text = _tidy_prose(strip_markup(drop_tool_nodes(inner)))
             if text:
                 parts.append(text)
         if parts:
@@ -218,21 +283,64 @@ def extract_assistant_text(content: str) -> str:
             sources.append((index, str(payload["content"])))
     if sources:
         sources.sort(key=lambda pair: pair[0])
-        return "".join(text for _, text in sources)
+        return _tidy_prose("".join(text for _, text in sources))
 
-    return strip_markup(content)
+    return _tidy_prose(strip_markup(drop_tool_nodes(content)))
 
 
-_ASSISTANT_SUFFIX_RE = re.compile(r"-(?:pending|committed(?:-[\w-]+)?)$")
+def harvest_sources(content: str) -> List[dict]:
+    """All `data-assistant-sources-payload` JSON blobs in one frame."""
+    out: List[dict] = []
+    seen: set = set()
+    for m in _SOURCES_PAYLOAD_RE.finditer(content):
+        try:
+            payload = json.loads(html.unescape(m.group(1)))
+        except (json.JSONDecodeError, ValueError, TypeError):
+            continue
+        if not isinstance(payload, list):
+            continue
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            key = (str(item.get("url") or ""), str(item.get("title") or ""))
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({
+                "title": str(item.get("title") or ""),
+                "url": str(item.get("url") or ""),
+                "attribution": str(item.get("attribution") or ""),
+            })
+    return out
+
+
+_SHIMMER_TEXT_RE = re.compile(r'data-text-shimmer-text="[^"]*">([^<]+)</span>')
+
+
+def harvest_status(content: str) -> List[str]:
+    """Tool status lines (`Searching the web`, `Searched 18 websites`, ...)."""
+    out: List[str] = []
+    for pattern in (_SHIMMER_TEXT_RE, _SHIMMER_RE):
+        for m in pattern.finditer(content):
+            text = html.unescape(m.group(1)).strip()
+            if text and text not in out:
+                out.append(text)
+    return out
+
+
+_ASSISTANT_SUFFIX_RE = re.compile(r"-(?:pending(?:-tail)?|committed(?:-[\w-]+)?)$")
 
 
 def assistant_group(name: str) -> str:
     """
-    `assistant-pending-<uuid>-committed-tail` -> `assistant-pending-<uuid>`.
+    `assistant-pending-<uuid>-committed-tail` -> `assistant-pending-<uuid>`
+    (same for `-pending` / `-pending-tail`).
 
-    The pending (streaming) region and the committed region of one message
-    share a group id; whatever the server has committed wins over what is
-    still pending.
+    The pending (streaming) region, its append-only tail and the committed
+    region of one message share a group id; whatever the server has
+    committed wins over what is still pending, and pending text is
+    assembled as head (`-pending`, replace) + tail (`-pending-tail`,
+    append).
     """
     return _ASSISTANT_SUFFIX_RE.sub("", name)
 
@@ -269,6 +377,8 @@ class DpuParser:
         self.terminated = False    # "terminal-received" / "message-stream-complete"
         self.failure: Optional[dict] = None
         self.controls: List[str] = []
+        self.status: List[str] = []      # tool activity, in order
+        self.sources: List[dict] = []     # citation payloads seen this turn
 
     # ------------------------------------------------------------------
     def feed(self, data: str) -> list[dict]:
@@ -351,9 +461,22 @@ class DpuParser:
                 seen.add(key)
                 events.append(event)
             if "assistant" in name:
-                text = extract_assistant_text(content)
-                if text:
-                    events.extend(self._apply_text(name, apply, text))
+                if apply == "replace" and name.endswith("-pending"):
+                    self.pending.pop(name + "-tail", None)
+                for line in harvest_status(content):
+                    if line not in self.status:
+                        self.status.append(line)
+                        events.append({"kind": "status", "text": line})
+                found = harvest_sources(content)
+                if found and found != self.sources:
+                    self.sources = found
+                    events.append({"kind": "sources", "sources": [dict(s) for s in found]})
+                # `-reasoning` templates only carry tool status / chain-of-
+                # thought chrome - never answer prose
+                if not name.endswith("-reasoning"):
+                    text = extract_assistant_text(content)
+                    if text:
+                        events.extend(self._apply_text(name, apply, text))
         if self.failure:
             events.append({
                 "kind": "error",
@@ -431,11 +554,34 @@ class DpuParser:
         full = self.answer
         if full == self.emitted:
             return []
-        common = 0
-        limit = min(len(full), len(self.emitted))
-        while common < limit and full[common] == self.emitted[common]:
-            common += 1
-        delta = full[common:]
+        # a pending -> committed swap can shrink or reorder the assembled
+        # text; never retract what was already streamed and never re-emit
+        # it (regrowth then continues from the longer prefix, no duplicates)
+        if len(full) < len(self.emitted) and self.emitted.startswith(full):
+            return []
+        # whitespace-tolerant prefix walk: the server may re-split a
+        # boundary (`2028.  ` vs `2028.\n `) - never re-emit across ws
+        i = j = 0
+        while i < len(self.emitted) and j < len(full):
+            old_c, new_c = self.emitted[i], full[j]
+            if old_c == new_c:
+                i += 1
+                j += 1
+                continue
+            if old_c.isspace() and new_c.isspace():
+                while i < len(self.emitted) and self.emitted[i].isspace():
+                    i += 1
+                while j < len(full) and full[j].isspace():
+                    j += 1
+                continue
+            if new_c.isspace():
+                j += 1     # server inserted whitespace (paragraph split)
+                continue
+            if old_c.isspace():
+                i += 1     # server dropped whitespace
+                continue
+            break
+        delta = full[j:]
         self.emitted = full
         return [{"kind": "delta", "delta": delta}] if delta else []
 
@@ -449,8 +595,20 @@ class DpuParser:
             committed_keys = [k for k in keys if k in self.committed]
             if committed_keys:
                 out.extend(self.committed[k] for k in committed_keys)
-            else:
-                out.extend(self.pending[k] for k in keys if k in self.pending)
+                continue
+            pending_keys = [k for k in keys if k in self.pending]
+            pending_keys.sort(key=lambda k: k.endswith("-pending-tail"))
+            head = "".join(
+                self.pending[k] for k in pending_keys
+                if not k.endswith("-pending-tail")
+            )
+            tail = "".join(
+                self.pending[k] for k in pending_keys
+                if k.endswith("-pending-tail")
+            )
+            if tail and head and tail in head:
+                tail = ""   # stale tail already covered by the new head
+            out.append(head + tail)
         return "".join(out)
 
 
@@ -479,6 +637,7 @@ class MwebChatClient:
         self._conversation_id = ""
         self._history: list[dict] = []
         self._parser: Optional[DpuParser] = None
+        self.last_turn: dict = {"status": [], "sources": [], "answer": ""}
 
     # ------------------------------------------------------------------
     # lifecycle
@@ -621,6 +780,20 @@ class MwebChatClient:
     # ------------------------------------------------------------------
     # steps
     # ------------------------------------------------------------------
+    async def _post_json_retry(
+        self, url: str, payload: dict, referer: str, attempts: int = 3
+    ) -> dict:
+        """`_post_json`, retrying transient upstream statuses with backoff."""
+        for attempt in range(attempts):
+            try:
+                return await self._post_json(url, payload, referer)
+            except UpstreamError as e:
+                if e.status in (429, 502, 503, 504) and attempt + 1 < attempts:
+                    await asyncio.sleep(3 * (attempt + 1))
+                    continue
+                raise
+        raise AssertionError("unreachable")
+
     async def _sentinel(self) -> Tuple[str, str, str, str]:
         """
         chat-requirements over plain HTTP.
@@ -630,7 +803,7 @@ class MwebChatClient:
         """
         referer = f"{BASE_URL}/"
         p = build_requirements_blob(self._profile)
-        prepare = await self._post_json(f"{SENTINEL_URL}/prepare", {"p": p}, referer)
+        prepare = await self._post_json_retry(f"{SENTINEL_URL}/prepare", {"p": p}, referer)
 
         body: dict = {"prepare_token": prepare.get("prepare_token", "")}
         proof = ""
@@ -660,7 +833,7 @@ class MwebChatClient:
             turnstile_token = await solve_turnstile(p, dx)
             body["turnstile"] = turnstile_token
 
-        final = await self._post_json(f"{SENTINEL_URL}/finalize", body, referer)
+        final = await self._post_json_retry(f"{SENTINEL_URL}/finalize", body, referer)
         token = final.get("token") or ""
         if not token:
             raise UpstreamError("chat-requirements finalize returned no token")
@@ -825,10 +998,21 @@ class MwebChatClient:
     # ------------------------------------------------------------------
     # public API
     # ------------------------------------------------------------------
-    async def send_message_stream(
+    async def send_message_events(
         self, message: str, timeout: float = 180, system: Optional[str] = None
-    ) -> AsyncGenerator[str, None]:
-        """Yield answer deltas for `message`, keeping the conversation alive."""
+    ) -> AsyncGenerator[dict, None]:
+        """
+        Yield stream events for `message`.
+
+            {"kind": "delta",   "delta": str}     answer prose only
+            {"kind": "status",  "text": str}      tool activity (search, ...)
+            {"kind": "sources", "sources": list}  citations for this turn
+            {"kind": "error",   "message": str}   surfaced as UpstreamError
+
+        Tool status and sources never enter the answer channel; `last_turn`
+        records `status`, `sources` and the authoritative final `answer`
+        once the turn settles.
+        """
         prompt = self._prompt_with_system(message, self.resolve_system(system))
         self._parser = None
         self._history.append({"role": "user", "content": message})
@@ -838,20 +1022,36 @@ class MwebChatClient:
             async for event in self._stream_prompt(prompt, timeout):
                 if event["kind"] == "delta":
                     answer += event["delta"]
-                    yield event["delta"]
+                    yield event
+                elif event["kind"] in ("status", "sources"):
+                    yield event
                 elif event["kind"] == "error":
                     error = event["message"]
         except (AuthError, UpstreamError, TurnstileRequiredError):
             raise
+        parser = self._parser
         # the parser's own view of the message is authoritative (block
         # re-splits can make the raw delta stream drift by a space/newline)
-        final = self._parser.answer if self._parser is not None and self._parser.answer else answer
+        final = parser.answer if parser is not None and parser.answer else answer
+        self.last_turn = {
+            "status": list(parser.status) if parser is not None else [],
+            "sources": [dict(s) for s in parser.sources] if parser is not None else [],
+            "answer": final,
+        }
         if final:
             self._history.append({"role": "assistant", "content": final})
             self._adopt_turn_state()
             self._system_state = self._system_applied
         elif error:
             raise UpstreamError(error)
+
+    async def send_message_stream(
+        self, message: str, timeout: float = 180, system: Optional[str] = None
+    ) -> AsyncGenerator[str, None]:
+        """Yield clean answer deltas for `message` (tool events filtered out)."""
+        async for event in self.send_message_events(message, timeout, system=system):
+            if event["kind"] == "delta":
+                yield event["delta"]
 
     async def send_message(
         self, message: str, timeout: float = 180, system: Optional[str] = None

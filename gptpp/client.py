@@ -846,10 +846,38 @@ async def _http_repl(timeout: float = 180, system: str = "") -> None:
                     print("[conversation reset]")
                     continue
 
-                print("Assistant: ", end="", flush=True)
-                async for delta in client.send_message_stream(user_input, timeout):
-                    print(delta, end="", flush=True)
+                answer_started = False
+                sources: list = []
+                async for event in client.send_message_events(user_input, timeout):
+                    kind = event.get("kind")
+                    if kind == "status":
+                        # tool activity lives on its own line, above/separate
+                        # from the answer text
+                        if answer_started:
+                            print(f"\n[tool] {event['text']}\n", end="", flush=True)
+                        else:
+                            print(f"[tool] {event['text']}", flush=True)
+                    elif kind == "sources":
+                        sources = event.get("sources") or []
+                    elif kind == "delta":
+                        if not answer_started:
+                            print("Assistant: ", end="", flush=True)
+                            answer_started = True
+                        print(event["delta"], end="", flush=True)
                 print()
+                if sources:
+                    print("Sources:")
+                    for i, src in enumerate(sources, 1):
+                        label = " - ".join(
+                            part for part in (
+                                f"[{i}]",
+                                src.get("attribution") or "",
+                                src.get("title") or "",
+                            ) if part
+                        )
+                        print(f"  {label}")
+                        if src.get("url"):
+                            print(f"      {src['url']}")
             except KeyboardInterrupt:
                 print("\n\nGoodbye!")
                 break

@@ -105,6 +105,7 @@ class ChatGptApiClient:
         self._mweb: Optional[MwebChatClient] = None
         self._mweb_chat_id: Optional[str] = None
         self._mweb_notice = False
+        self._mweb_final: str = ""
 
     # ------------------------------------------------------------------
     # credentials
@@ -794,6 +795,7 @@ class ChatGptApiClient:
     async def _mweb_stream(self, messages: list, timeout: float,
                             system: Optional[str] = None) -> AsyncGenerator[str, None]:
         """Replay through the anonymous `/unauth-mweb` flow (pure HTTP)."""
+        self._mweb_final = ""
         if self._mweb is None:
             self._mweb = MwebChatClient()
             await self._mweb.open()
@@ -817,6 +819,9 @@ class ChatGptApiClient:
         ):
             if chunk:
                 yield chunk
+        # parser's final answer is authoritative (deltas can carry stale
+        # pending-preview text across a pending -> committed swap)
+        self._mweb_final = self._mweb.last_turn.get("answer", "") or ""
 
     async def _browser_stream(self, messages: list, model: Optional[str],
                               opts: dict) -> AsyncGenerator[str, None]:
@@ -830,10 +835,15 @@ class ChatGptApiClient:
             if chunk:
                 yield chunk
 
+    def _compose_reply(self, chunks: list) -> str:
+        """Prefer the mweb parser's authoritative final answer when it ran."""
+        return (self._mweb_final or "".join(chunks))
+
     async def _do_stream(self, messages: list, timeout: float = 120,
                          chat_id: Optional[str] = None, model: Optional[str] = None,
                          opts: Optional[dict] = None) -> AsyncGenerator[str, None]:
         opts = opts or {}
+        self._mweb_final = ""
         await self._ensure_session()
 
         if chat_id is not None and chat_id != self._chat_id:
@@ -980,7 +990,7 @@ class ChatGptApiClient:
             attachments=attachments, system=system,
         ):
             chunks.append(chunk)
-        reply = "".join(chunks)
+        reply = self._compose_reply(chunks)
         if reply:
             self._history.append({"role": "assistant", "content": reply})
         return reply
@@ -1026,7 +1036,7 @@ class ChatGptApiClient:
             attachments=attachments, system=system,
         ):
             chunks.append(chunk)
-        reply = "".join(chunks)
+        reply = self._compose_reply(chunks)
         self._history = list(messages)
         if reply:
             self._history.append({"role": "assistant", "content": reply})
@@ -1087,6 +1097,7 @@ class ChatGptApiClient:
 
         self._system_state = self._system_applied
         self._history.append({"role": "user", "content": message})
-        if answer:
-            self._history.append({"role": "assistant", "content": "".join(answer)})
-        return {"thinking": "".join(thinking), "response": "".join(answer)}
+        text = self._compose_reply(answer)
+        if text:
+            self._history.append({"role": "assistant", "content": text})
+        return {"thinking": "".join(thinking), "response": text}
