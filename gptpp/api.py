@@ -854,44 +854,46 @@ class ChatGptApiClient:
         if self._chat_id and self._parent_msg_id is None:
             self._parent_msg_id = await self._fetch_leaf(self._chat_id)
 
-        # each attempt re-mints chat-requirements (~seconds of PoW) - anonymous
-        # sessions cannot win /backend-api enforcement anyway, so go to the
-        # mweb fallback after a single attempt
+        # anonymous sessions cannot win /backend-api enforcement - when a
+        # fallback is configured, skip the doomed attempt entirely instead
+        # of re-minting chat-requirements (~seconds of PoW) every call
         fallback = self.mweb_fallback or self.browser_fallback
-        max_attempts = 1 if (fallback and not self.logged_in) else 3
+        skip_backend = bool(fallback and not self.logged_in)
+        max_attempts = 1 if skip_backend else 3
         last_error: Optional[Exception] = None
-        for attempt in range(1, max_attempts + 1):
-            try:
-                async for phase, delta in self._stream_once(messages, timeout, model, opts):
-                    if phase == "answer":
-                        yield delta
-                self._system_state = self._system_applied
-                return
-            except SentinelError as e:
-                last_error = e
-                if not fallback:
-                    raise
-                break
-            except AuthError as e:
-                last_error = e
-                if self.logged_in and attempt < max_attempts:
-                    print("[api] session expired - refreshing access token...", flush=True)
-                    await self.refresh_session()
-                    continue
-                break
-            except UpstreamError as e:
-                last_error = e
-                status = e.status
-                if status == 401 and self.logged_in and attempt < max_attempts:
-                    print("[api] 401 - refreshing access token...", flush=True)
-                    await self.refresh_session()
-                    continue
-                if status == 403 and attempt < max_attempts:
-                    print("[api] 403 sentinel enforcement - refreshing chat-requirements...", flush=True)
-                    self._requirements = None
-                    await self.refresh_requirements(force=True)
-                    continue
-                break
+        if not skip_backend:
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    async for phase, delta in self._stream_once(messages, timeout, model, opts):
+                        if phase == "answer":
+                            yield delta
+                    self._system_state = self._system_applied
+                    return
+                except SentinelError as e:
+                    last_error = e
+                    if not fallback:
+                        raise
+                    break
+                except AuthError as e:
+                    last_error = e
+                    if self.logged_in and attempt < max_attempts:
+                        print("[api] session expired - refreshing access token...", flush=True)
+                        await self.refresh_session()
+                        continue
+                    break
+                except UpstreamError as e:
+                    last_error = e
+                    status = e.status
+                    if status == 401 and self.logged_in and attempt < max_attempts:
+                        print("[api] 401 - refreshing access token...", flush=True)
+                        await self.refresh_session()
+                        continue
+                    if status == 403 and attempt < max_attempts:
+                        print("[api] 403 sentinel enforcement - refreshing chat-requirements...", flush=True)
+                        self._requirements = None
+                        await self.refresh_requirements(force=True)
+                        continue
+                    break
 
         if not fallback:
             if isinstance(last_error, UpstreamError) and last_error.status == 403:
