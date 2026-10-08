@@ -106,6 +106,11 @@ _TOKEN_RE = re.compile(r"<(/?)([a-zA-Z][\w-]*)((?:[^>\"']|\"[^\"]*\"|'[^']*')*)>
 
 def _is_tool_node(tag: str, attrs: str) -> bool:
     """Citation chips, grouped-webpage buttons, source footnotes."""
+    if ("data-assistant-entity-reference" in attrs
+            or 'data-content-reference-type="entity"' in attrs):
+        # inline entity chip: its name IS the prose word (`NASA's
+        # [Curiosity rover] has captured ...`) - unwrap, never drop
+        return False
     return (
         "data-assistant-content-reference" in attrs
         or "data-assistant-grouped-webpages" in attrs
@@ -366,6 +371,8 @@ class DpuParser:
     _OPEN_RE = re.compile(r"<template\b[^>]*>")
     _CLOSE = "</template>"
 
+    TRACE = False   # test harness flips this on for composition postmortems
+
     def __init__(self) -> None:
         self.buffer = ""
         self.pending: Dict[str, str] = {}    # streaming region text
@@ -382,6 +389,7 @@ class DpuParser:
         self.controls: List[str] = []
         self.status: List[str] = []      # tool activity, in order
         self.sources: List[dict] = []     # citation payloads seen this turn
+        self.trace: list = []             # composition trace when TRACE is on
 
     # ------------------------------------------------------------------
     def feed(self, data: str) -> list[dict]:
@@ -541,6 +549,7 @@ class DpuParser:
 
     # ------------------------------------------------------------------
     def _apply_text(self, name: str, apply: str, text: str) -> list[dict]:
+        emitted_before = self.emitted
         group = assistant_group(name)
         suffix = name[len(group):]
         store = self.committed if "-committed" in suffix else self.pending
@@ -555,38 +564,51 @@ class DpuParser:
             self.group_keys[group].append(name)
 
         full = self.answer
+        events: list[dict] = []
         if full == self.emitted:
-            return []
+            pass
         # a pending -> committed swap can shrink or reorder the assembled
         # text; never retract what was already streamed and never re-emit
         # it (regrowth then continues from the longer prefix, no duplicates)
-        if len(full) < len(self.emitted) and self.emitted.startswith(full):
-            return []
-        # whitespace-tolerant prefix walk: the server may re-split a
-        # boundary (`2028.  ` vs `2028.\n `) - never re-emit across ws
-        i = j = 0
-        while i < len(self.emitted) and j < len(full):
-            old_c, new_c = self.emitted[i], full[j]
-            if old_c == new_c:
-                i += 1
-                j += 1
-                continue
-            if old_c.isspace() and new_c.isspace():
-                while i < len(self.emitted) and self.emitted[i].isspace():
+        elif len(full) < len(self.emitted) and self.emitted.startswith(full):
+            pass
+        else:
+            # whitespace-tolerant prefix walk: the server may re-split a
+            # boundary (`2028.  ` vs `2028.\n `) - never re-emit across ws
+            i = j = 0
+            while i < len(self.emitted) and j < len(full):
+                old_c, new_c = self.emitted[i], full[j]
+                if old_c == new_c:
                     i += 1
-                while j < len(full) and full[j].isspace():
                     j += 1
-                continue
-            if new_c.isspace():
-                j += 1     # server inserted whitespace (paragraph split)
-                continue
-            if old_c.isspace():
-                i += 1     # server dropped whitespace
-                continue
-            break
-        delta = full[j:]
-        self.emitted = full
-        return [{"kind": "delta", "delta": delta}] if delta else []
+                    continue
+                if old_c.isspace() and new_c.isspace():
+                    while i < len(self.emitted) and self.emitted[i].isspace():
+                        i += 1
+                    while j < len(full) and full[j].isspace():
+                        j += 1
+                    continue
+                if new_c.isspace():
+                    j += 1     # server inserted whitespace (paragraph split)
+                    continue
+                if old_c.isspace():
+                    i += 1     # server dropped whitespace
+                    continue
+                break
+            delta = full[j:]
+            self.emitted = full
+            if delta:
+                events = [{"kind": "delta", "delta": delta}]
+        if self.TRACE:
+            self.trace.append({
+                "name": name, "apply": apply, "text": text,
+                "answer": full, "emitted_before": emitted_before,
+                "emitted_after": self.emitted,
+                "delta": "".join(e["delta"] for e in events),
+                "pending": dict(self.pending),
+                "committed": dict(self.committed),
+            })
+        return events
 
     # ------------------------------------------------------------------
     @property
