@@ -29,12 +29,13 @@ import json
 import re
 import time
 import uuid
-from typing import AsyncGenerator, Dict, List, Optional, Tuple
+from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 
 import aiohttp
 from yarl import URL
 
 from .errors import AuthError, TurnstileRequiredError, UpstreamError
+from .routing import base as relay_base, cookie_jar, via
 from .sentinel import (
     BASE_URL,
     MAX_POW_ATTEMPTS,
@@ -52,8 +53,16 @@ PREPARE_URL = f"{MW_URL}/conversation/prepare"
 SENTINEL_URL = f"{MW_URL}/sentinel/chat-requirements"
 
 DPU_CONTENT_TYPE = "text/vnd.openai.web-mobile-partial+html"
+SOURCE_NDJSON = "application/vnd.openai.conversation-source+ndjson"
 FORM_CT = "application/x-www-form-urlencoded;charset=UTF-8"
 JSON_CT = "application/json;charset=UTF-8"
+
+_AFFINITY_RE = re.compile(r'data-conversation-document-affinity="([^"]{1,2048})"')
+_WORKER_VERSION_RE = re.compile(r'data-worker-version-id="([A-Za-z0-9._-]{1,64})"')
+_SESSION_ID_RE = re.compile(
+    r'<input[^>]*name="oai-session-id"[^>]*value="([^"]{1,64})"'
+)
+_SESSION_ID_JSON_RE = re.compile(r'"sessionId":"([0-9a-fA-F-]{36})"')
 
 _CLIENT_CONTEXT = {
     "app_name": "chatgpt.com",
@@ -353,6 +362,88 @@ def assistant_group(name: str) -> str:
     return _ASSISTANT_SUFFIX_RE.sub("", name)
 
 
+def _walk_emitted(emitted: str, full: str) -> "tuple[str, str]":
+    """Prefix-walk old vs new answer text; return (delta, new_emitted).
+
+    Never retracts what was already streamed: a shrink that keeps the
+    emitted prefix stays put, whitespace-only drift is skipped, and only
+    genuinely new text is returned as the delta.
+    """
+    if full == emitted:
+        return "", emitted
+    if len(full) < len(emitted) and emitted.startswith(full):
+        return "", emitted
+    i = j = 0
+    while i < len(emitted) and j < len(full):
+        old_c, new_c = emitted[i], full[j]
+        if old_c == new_c:
+            i += 1
+            j += 1
+            continue
+        if old_c.isspace() and new_c.isspace():
+            while i < len(emitted) and emitted[i].isspace():
+                i += 1
+            while j < len(full) and full[j].isspace():
+                j += 1
+            continue
+        if new_c.isspace():
+            j += 1     # server inserted whitespace (paragraph split)
+            continue
+        if old_c.isspace():
+            i += 1     # server dropped whitespace
+            continue
+        break
+    return full[j:], full
+
+
+def adopt_state(holder, raw: str) -> None:
+    if not raw:
+        return
+    try:
+        state = json.loads(html.unescape(raw))
+    except (json.JSONDecodeError, ValueError):
+        return
+    if isinstance(state, dict) and state:
+        holder.conversation_state = state
+
+
+def apply_controls(holder, content: str) -> List[dict]:
+    """Recognize `data-conversation-control` spans; update `holder` flags."""
+    events: List[dict] = []
+    matches = list(_CONTROL_RE.finditer(content))
+    if not matches:
+        matches = list(_DOC_CONTROL_RE.finditer(content))
+    for match in matches:
+        name = match.group(1)
+        attrs = dict(_ATTR_RE.findall(match.group(2)))
+        holder.controls.append(name)
+        if name == "conversation-id":
+            if attrs.get("conversation-id"):
+                holder.conversation_id = attrs["conversation-id"]
+        elif name == "message-stream-complete":
+            if attrs.get("conversation-id"):
+                holder.conversation_id = attrs["conversation-id"]
+            holder.terminated = True
+            if attrs.get("message-id"):
+                holder.message_id = attrs["message-id"]
+            adopt_state(holder, attrs.get("conversation-state"))
+        elif name in ("terminal-received", "complete"):
+            holder.terminated = True
+            if attrs.get("message-id"):
+                holder.message_id = attrs["message-id"]
+            adopt_state(holder, attrs.get("conversation-state"))
+            if name == "complete":
+                holder.done = True
+        elif name == "failed":
+            holder.failure = {
+                "reason": attrs.get("failure-reason") or "",
+                "status": attrs.get("failure-status") or "",
+                "origin": attrs.get("failure-origin") or "",
+            }
+        events.append({"kind": "control", "name": name, "attrs": attrs})
+    return events
+
+
 class DpuParser:
     """
     Incremental parser for `text/vnd.openai.web-mobile-partial+html` streams.
@@ -503,49 +594,10 @@ class DpuParser:
         return events
 
     def _controls(self, content: str) -> list[dict]:
-        events: list[dict] = []
-        matches = list(_CONTROL_RE.finditer(content))
-        if not matches:
-            matches = list(_DOC_CONTROL_RE.finditer(content))
-        for match in matches:
-            name = match.group(1)
-            attrs = dict(_ATTR_RE.findall(match.group(2)))
-            self.controls.append(name)
-            if name == "conversation-id":
-                if attrs.get("conversation-id"):
-                    self.conversation_id = attrs["conversation-id"]
-            elif name == "message-stream-complete":
-                if attrs.get("conversation-id"):
-                    self.conversation_id = attrs["conversation-id"]
-                self.terminated = True
-                if attrs.get("message-id"):
-                    self.message_id = attrs["message-id"]
-                self._adopt_state(attrs.get("conversation-state"))
-            elif name in ("terminal-received", "complete"):
-                self.terminated = True
-                if attrs.get("message-id"):
-                    self.message_id = attrs["message-id"]
-                self._adopt_state(attrs.get("conversation-state"))
-                if name == "complete":
-                    self.done = True
-            elif name == "failed":
-                self.failure = {
-                    "reason": attrs.get("failure-reason") or "",
-                    "status": attrs.get("failure-status") or "",
-                    "origin": attrs.get("failure-origin") or "",
-                }
-            events.append({"kind": "control", "name": name, "attrs": attrs})
-        return events
+        return apply_controls(self, content)
 
     def _adopt_state(self, raw: str) -> None:
-        if not raw:
-            return
-        try:
-            state = json.loads(html.unescape(raw))
-        except (json.JSONDecodeError, ValueError):
-            return
-        if isinstance(state, dict) and state:
-            self.conversation_state = state
+        adopt_state(self, raw)
 
     # ------------------------------------------------------------------
     def _apply_text(self, name: str, apply: str, text: str) -> list[dict]:
@@ -575,28 +627,7 @@ class DpuParser:
         else:
             # whitespace-tolerant prefix walk: the server may re-split a
             # boundary (`2028.  ` vs `2028.\n `) - never re-emit across ws
-            i = j = 0
-            while i < len(self.emitted) and j < len(full):
-                old_c, new_c = self.emitted[i], full[j]
-                if old_c == new_c:
-                    i += 1
-                    j += 1
-                    continue
-                if old_c.isspace() and new_c.isspace():
-                    while i < len(self.emitted) and self.emitted[i].isspace():
-                        i += 1
-                    while j < len(full) and full[j].isspace():
-                        j += 1
-                    continue
-                if new_c.isspace():
-                    j += 1     # server inserted whitespace (paragraph split)
-                    continue
-                if old_c.isspace():
-                    i += 1     # server dropped whitespace
-                    continue
-                break
-            delta = full[j:]
-            self.emitted = full
+            delta, self.emitted = _walk_emitted(self.emitted, full)
             if delta:
                 events = [{"kind": "delta", "delta": delta}]
         if self.TRACE:
@@ -655,6 +686,170 @@ class DpuParser:
         return "".join(out)
 
 
+class SourceNdjsonParser:
+    """
+    Incremental parser for `application/vnd.openai.conversation-source+ndjson`.
+
+    Since the document-affinity rollout `conversation/updates` answers in
+    newline-delimited JSON instead of DPU frames; feed() keeps DpuParser's
+    event contract so the stream loop stays format-agnostic:
+
+        {"kind": "delta",   "delta": str}
+        {"kind": "control", "name": str, "attrs": dict}
+        {"kind": "status",  "text": str}
+        {"kind": "sources", "sources": list}
+        {"kind": "done"}
+        {"kind": "error",   "message": str, "failure": dict}
+    """
+
+    def __init__(self) -> None:
+        self.buffer = ""
+        self.emitted = ""
+        self.conversation_id = ""
+        self.conversation_state: dict = {}
+        self.message_id = ""
+        self.done = False          # control "complete" seen
+        self.terminated = False    # "end" event / terminal control seen
+        self.failure: Optional[dict] = None
+        self.controls: List[str] = []
+        self.status: List[str] = []
+        self.sources: List[dict] = []
+        self.trace: list = []
+        self._texts: Dict[str, str] = {}
+
+    @property
+    def answer(self) -> str:
+        if not self._texts:
+            return ""
+        last = next(reversed(self._texts))
+        return self._texts[last]
+
+    def feed(self, data: str) -> list[dict]:
+        self.buffer += data
+        events: list[dict] = []
+        while True:
+            nl = self.buffer.find("\n")
+            if nl < 0:
+                break
+            line = self.buffer[:nl]
+            self.buffer = self.buffer[nl + 1:]
+            events.extend(self._line(line.strip()))
+        return events
+
+    # ------------------------------------------------------------------
+    def _line(self, line: str) -> list[dict]:
+        if not line:
+            return []
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(event, dict):
+            return []
+        kind = event.get("type")
+        if kind == "content":
+            return self._content(event)
+        if kind == "shared":
+            return self._shared(event.get("html") or "")
+        if kind == "control":
+            return self._control(event)
+        if kind == "end":
+            self.terminated = True
+            return [{"kind": "done"}]
+        if kind in ("error", "diagnostic"):
+            detail = event.get("detail") or {}
+            message = (
+                event.get("message")
+                or detail.get("kind")
+                or event.get("detailText")
+                or "stream error"
+            )
+            if kind == "diagnostic":
+                return [{"kind": "control", "name": str(message), "attrs": {}}]
+            self.failure = {"reason": str(message), "status": ""}
+            return [{
+                "kind": "error",
+                "message": f"conversation update failed: {message}",
+                "failure": dict(self.failure),
+            }]
+        return []
+
+    def _content(self, event: dict) -> list[dict]:
+        message_id = str(event.get("messageId") or "")
+        markdown = event.get("markdown")
+        if not isinstance(markdown, str):
+            markdown = ""
+        if message_id and message_id not in self._texts:
+            self._texts[message_id] = ""
+        if event.get("mode") == "append" and message_id:
+            self._texts[message_id] = self._texts[message_id] + markdown
+        elif message_id:
+            self._texts[message_id] = markdown
+        if message_id:
+            self.message_id = message_id
+        full = self.answer
+        delta, self.emitted = _walk_emitted(self.emitted, full)
+        if delta:
+            return [{"kind": "delta", "delta": delta}]
+        return []
+
+    def _shared(self, html: str) -> list[dict]:
+        events: list[dict] = []
+        for event in apply_controls(self, html):
+            events.append(event)
+        for line in harvest_status(html):
+            if line not in self.status:
+                self.status.append(line)
+                events.append({"kind": "status", "text": line})
+        found = harvest_sources(html)
+        if found and found != self.sources:
+            self.sources = found
+            events.append({"kind": "sources", "sources": [dict(s) for s in found]})
+        if self.failure:
+            events.append({
+                "kind": "error",
+                "message": (
+                    "conversation update failed: "
+                    f"{self.failure.get('reason') or 'unknown'}"
+                    f" (status {self.failure.get('status') or '?'})"
+                ),
+                "failure": dict(self.failure),
+            })
+        elif self.done:
+            events.append({"kind": "done"})
+        return events
+
+    def _control(self, event: dict) -> list[dict]:
+        detail = event.get("detail") or {}
+        name = str(detail.get("kind") or "control")
+        if name == "conversation-id":
+            if detail.get("conversationId"):
+                self.conversation_id = str(detail["conversationId"])
+        elif name == "failed":
+            self.failure = {
+                "reason": str(
+                    detail.get("failureReason") or detail.get("reason") or ""
+                ),
+                "status": str(detail.get("status") or ""),
+                "origin": str(detail.get("origin") or ""),
+            }
+            return [{
+                "kind": "error",
+                "message": (
+                    "conversation update failed: "
+                    f"{self.failure.get('reason') or 'unknown'}"
+                    f" (status {self.failure.get('status') or '?'})"
+                ),
+                "failure": dict(self.failure),
+            }]
+        elif name in ("terminal-received", "complete", "message-stream-complete"):
+            self.terminated = True
+            if name in ("terminal-received", "complete"):
+                self.done = self.done or name == "complete"
+        self.controls.append(name)
+        return [{"kind": "control", "name": name, "attrs": dict(detail)}]
+
+
 class MwebChatClient:
     """Pure-HTTP chatgpt.com client built on `/unauth-mweb/conversation/updates`."""
 
@@ -680,6 +875,8 @@ class MwebChatClient:
         self._conversation_id = ""
         self._history: list[dict] = []
         self._parser: Optional[DpuParser] = None
+        self._doc_affinity = ""
+        self._worker_version_id = ""
         self.last_turn: dict = {"status": [], "sources": [], "answer": ""}
 
     # ------------------------------------------------------------------
@@ -693,22 +890,72 @@ class MwebChatClient:
                     "Accept-Language": "en-US,en;q=0.9",
                     "Origin": BASE_URL,
                     "Referer": f"{BASE_URL}/",
-                }
+                },
+                cookie_jar=cookie_jar(),
             )
             self._own_session = True
-        try:
-            async with self._session.get(
-                f"{BASE_URL}/", timeout=aiohttp.ClientTimeout(total=30)
-            ) as resp:
-                await resp.read()
-        except aiohttp.ClientError:
-            pass
+        await self._refresh_document()
         await self._ensure_mweb_cookies()
         return self
 
+    async def _refresh_document(self) -> None:
+        """Fetch the page HTML and extract this session's document tokens.
+
+        `conversation/updates` requires the per-page
+        `X-Web-Mobile-Conversation-Document-Affinity` (plus the matching
+        worker version); without it the server answers 409 with
+        `X-Web-Mobile-Conversation-Document-Upgrade: required`, and a
+        token from another session gets 403 `Invalid conversation
+        document affinity`. Both values live in the page's data
+        attributes, so the HTML must be fetched through this session.
+        """
+        if self._session is None or self._session.closed:
+            return
+        try:
+            async with self._session.get(
+                via(f"{BASE_URL}/"),
+                headers={
+                    "Accept": (
+                        "text/html,application/xhtml+xml,"
+                        "application/xml;q=0.9,*/*;q=0.8"
+                    ),
+                    "Sec-Fetch-Dest": "document",
+                    "Sec-Fetch-Mode": "navigate",
+                    "Sec-Fetch-Site": "none",
+                    "Upgrade-Insecure-Requests": "1",
+                },
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                if resp.status != 200:
+                    return
+                text = await resp.text()
+        except aiohttp.ClientError:
+            return
+        m = _AFFINITY_RE.search(text)
+        if m:
+            self._doc_affinity = m.group(1)
+        m = _WORKER_VERSION_RE.search(text)
+        if m:
+            self._worker_version_id = m.group(1)
+        m = _SESSION_ID_RE.search(text) or _SESSION_ID_JSON_RE.search(text)
+        if m:
+            # The affinity token is signed over the page's session id, so
+            # every request must present the same oai-session-id.
+            self._session_id = m.group(1)
+
+    def _document_headers(self) -> dict:
+        out = {}
+        if self._doc_affinity:
+            out["x-web-mobile-conversation-document-affinity"] = (
+                self._doc_affinity
+            )
+        if self._worker_version_id:
+            out["x-web-mobile-document-worker-version"] = self._worker_version_id
+        return out
+
     async def _ensure_mweb_cookies(self) -> None:
         jar = self._session.cookie_jar
-        have = set(jar.filter_cookies(f"{BASE_URL}/"))
+        have = set(jar.filter_cookies(f"{relay_base()}/"))
         extra = {}
         if "oai-mweb-route" not in have:
             extra["oai-mweb-route"] = "1"
@@ -717,7 +964,7 @@ class MwebChatClient:
         if "oai-did" not in have:
             extra["oai-did"] = str(uuid.uuid4())
         if extra:
-            jar.update_cookies(extra, URL(f"{BASE_URL}/"))
+            jar.update_cookies(extra, URL(f"{relay_base()}/"))
 
     async def close(self) -> None:
         if self._own_session and self._session and not self._session.closed:
@@ -801,7 +1048,7 @@ class MwebChatClient:
     async def _post_json(self, url: str, payload: dict, referer: str, timeout: float = 60) -> dict:
         session = await self._require_session()
         async with session.post(
-            url,
+            via(url),
             data=json.dumps(payload, separators=(",", ":")),
             headers=self._headers(referer, "application/json", JSON_CT),
             timeout=aiohttp.ClientTimeout(total=timeout),
@@ -897,7 +1144,7 @@ class MwebChatClient:
             }
         )
         async with session.post(
-            f"{PREPARE_URL}?lightweight_authenticated=0",
+            via(f"{PREPARE_URL}?lightweight_authenticated=0"),
             data=form,
             headers=headers,
             timeout=aiohttp.ClientTimeout(total=60),
@@ -933,7 +1180,7 @@ class MwebChatClient:
     # streaming
     # ------------------------------------------------------------------
     async def _stream_prompt(
-        self, prompt: str, timeout: float = 180
+        self, prompt: str, timeout: float = 180, _attempt: int = 0
     ) -> AsyncGenerator[dict, None]:
         session = await self._require_session()
         referer = (
@@ -969,31 +1216,43 @@ class MwebChatClient:
                 "userMessageId": str(uuid.uuid4()),
             }
         )
-        headers = self._headers(referer, DPU_CONTENT_TYPE, FORM_CT)
+        headers = self._headers(referer, SOURCE_NDJSON, FORM_CT)
         headers.update(
             {
                 "x-conduit-token": conduit,
                 "x-oai-turn-trace-id": str(uuid.uuid4()),
                 "x-web-mobile-prepare-state": "success",
+                "x-web-mobile-conversation-source": "1",
                 "x-web-mobile-conversation-renderer": "octane",
                 "x-web-mobile-conversation-stream-protocol": "2",
             }
         )
+        headers.update(self._document_headers())
         url = f"{UPDATES_URL}?lightweight_authenticated=0&operationId={uuid.uuid4()}"
 
-        parser = DpuParser()
-        self._parser = parser
+        parser: Any = None
+        self._parser = None
         decoder = codecs.getincrementaldecoder("utf-8")(errors="ignore")
         stream_error: Optional[str] = None
 
         async with session.post(
-            url,
+            via(url),
             data=form,
             headers=headers,
             timeout=aiohttp.ClientTimeout(total=timeout),
         ) as resp:
             if resp.status != 200:
                 body = await resp.text()
+                stale_document = resp.status == 409 or (
+                    resp.status == 403 and "affinity" in body.lower()
+                )
+                if stale_document and _attempt == 0:
+                    await self._refresh_document()
+                    async for event in self._stream_prompt(
+                        prompt, timeout, _attempt=1
+                    ):
+                        yield event
+                    return
                 if resp.status in (401, 403):
                     raise AuthError(f"conversation updates rejected ({resp.status}): {body[:300]}")
                 raise UpstreamError(
@@ -1001,6 +1260,13 @@ class MwebChatClient:
                     status=resp.status,
                     body=body,
                 )
+            # document-affinity era: ndjson above the wire; older code
+            # paths still speak DPU frames - pick by the answer's type
+            ctype = resp.headers.get("content-type", "")
+            parser = (
+                SourceNdjsonParser() if "ndjson" in ctype else DpuParser()
+            )
+            self._parser = parser
             finished = False
             async for raw in resp.content.iter_any():
                 if not raw:
@@ -1015,6 +1281,15 @@ class MwebChatClient:
                 if finished:
                     break
 
+        if parser is None:
+            return
+        # flush a final line that closed without a trailing newline
+        for event in parser.feed("\n"):
+            if event["kind"] == "error":
+                stream_error = event["message"]
+            yield event
+            if event["kind"] in ("done", "error"):
+                break
         if stream_error or parser.failure:
             return
         if parser.done or parser.terminated:

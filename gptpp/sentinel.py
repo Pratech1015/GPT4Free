@@ -35,6 +35,7 @@ from typing import Optional
 import aiohttp
 
 from .errors import TurnstileRequiredError, UpstreamError
+from .routing import via
 
 REQUIREMENTS_PREFIX = "gAAAAAC"   # fingerprint blob
 PROOF_PREFIX = "gAAAAAB"          # proof-of-work answer
@@ -213,7 +214,7 @@ async def get_chat_requirements(
     ct = aiohttp.ClientTimeout(total=timeout)
 
     async with session.post(
-        f"{API_URL}/sentinel/chat-requirements/prepare",
+        via(f"{API_URL}/sentinel/chat-requirements/prepare"),
         data=json.dumps({"p": blob}, separators=(",", ":")),
         timeout=ct,
     ) as resp:
@@ -253,7 +254,7 @@ async def get_chat_requirements(
         )
 
     async with session.post(
-        f"{API_URL}/sentinel/chat-requirements/finalize",
+        via(f"{API_URL}/sentinel/chat-requirements/finalize"),
         data=json.dumps(body, separators=(",", ":")),
         timeout=ct,
     ) as resp:

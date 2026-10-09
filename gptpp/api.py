@@ -28,6 +28,7 @@ import aiohttp
 
 from .errors import AttachmentError, AuthError, SentinelError, UpstreamError
 from .mweb import MwebChatClient, apply_system_prompt, flatten_messages
+from .routing import cookie_jar, via
 from .sentinel import ChatRequirements, USER_AGENT as SENTINEL_UA, get_chat_requirements
 
 CREDENTIALS_FILE = os.path.join(os.path.dirname(__file__), ".chatgpt_credentials.json")
@@ -194,8 +195,10 @@ class ChatGptApiClient:
             "Referer": f"{self.BASE_URL}/",
             "Cookie": self.cookie,
         }
-        async with aiohttp.ClientSession(headers=headers) as s:
-            async with s.get(f"{self.BASE_URL}/api/auth/session",
+        async with aiohttp.ClientSession(
+            headers=headers, cookie_jar=cookie_jar()
+        ) as s:
+            async with s.get(via(f"{self.BASE_URL}/api/auth/session"),
                              timeout=aiohttp.ClientTimeout(total=30)) as resp:
                 text = await resp.text()
                 if resp.status != 200:
@@ -243,12 +246,14 @@ class ChatGptApiClient:
             headers["Authorization"] = f"Bearer {self.token}"
         if self.cookie:
             headers["Cookie"] = self.cookie
-        async with aiohttp.ClientSession(headers=headers) as s:
+        async with aiohttp.ClientSession(
+            headers=headers, cookie_jar=cookie_jar()
+        ) as s:
             if not self.cookie:
                 # chatgpt.com 401s the sentinel endpoints without first-party
                 # cookies - a warm-up GET collects them into the jar
                 try:
-                    async with s.get(f"{self.BASE_URL}/",
+                    async with s.get(via(f"{self.BASE_URL}/"),
                                      timeout=aiohttp.ClientTimeout(total=30)) as warm:
                         await warm.read()
                 except Exception:
@@ -293,14 +298,16 @@ class ChatGptApiClient:
             except Exception:
                 pass
             self._session = None
-        self._session = aiohttp.ClientSession(headers=self._headers(), loop=loop)
+        self._session = aiohttp.ClientSession(
+            headers=self._headers(), loop=loop, cookie_jar=cookie_jar()
+        )
         self._own_session = True
         if not self.cookie:
             # chatgpt.com answers API/sentinel routes with 401 until we hold
             # its first-party cookies - a warm-up GET fills the jar
             try:
                 async with self._session.get(
-                    f"{self.BASE_URL}/", timeout=aiohttp.ClientTimeout(total=30)
+                    via(f"{self.BASE_URL}/"), timeout=aiohttp.ClientTimeout(total=30)
                 ) as warm:
                     await warm.read()
             except Exception:
@@ -338,7 +345,7 @@ class ChatGptApiClient:
         try:
             await self._ensure_session()
             async with self._session.get(
-                f"{self.API_URL}/models", timeout=aiohttp.ClientTimeout(total=30)
+                via(f"{self.API_URL}/models"), timeout=aiohttp.ClientTimeout(total=30)
             ) as resp:
                 if resp.status != 200:
                     return list(DEFAULT_MODELS)
@@ -363,7 +370,7 @@ class ChatGptApiClient:
         try:
             await self._ensure_session()
             async with self._session.get(
-                f"{self.API_URL}/conversation/{chat_id}",
+                via(f"{self.API_URL}/conversation/{chat_id}"),
                 timeout=aiohttp.ClientTimeout(total=20),
             ) as resp:
                 if resp.status != 200:
@@ -525,7 +532,7 @@ class ChatGptApiClient:
         }
         await self._ensure_session()
         async with self._session.post(
-            f"{self.API_URL}/files",
+            via(f"{self.API_URL}/files"),
             data=json.dumps(meta, separators=(",", ":")),
             headers={"Content-Type": "application/json", "Accept": "application/json"},
             timeout=aiohttp.ClientTimeout(total=60),
@@ -723,7 +730,7 @@ class ChatGptApiClient:
         done = False
 
         async with self._session.post(
-            url,
+            via(url),
             data=body,
             headers=headers,
             timeout=aiohttp.ClientTimeout(total=timeout),
