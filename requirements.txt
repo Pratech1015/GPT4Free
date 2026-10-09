@@ -1,2 +1,2 @@
-aiohttp>=3.9
+curl_cffi>=0.16
 playwright>=1.40

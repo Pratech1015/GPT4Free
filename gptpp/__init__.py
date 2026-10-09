@@ -18,7 +18,7 @@ Every transport takes `system_prompt=` (per-call `system=` overrides it, `""`
 disables); chatgpt.com has no system role, so instructions travel in-band as
 a `System instruction:` header on the first turn of each conversation.
 
-Dependencies: aiohttp (HTTP core), node >= 18 (Turnstile solver),
+Dependencies: curl_cffi (HTTP core with browser TLS), node >= 18 (Turnstile solver),
 playwright (login + browser fallback).
 Run `python -m gptpp.login` once to capture a logged-in session; run
 `python -m gptpp.client` for the REPL (pure HTTP by default, `--system` for

@@ -24,11 +24,10 @@ import time
 import uuid
 from typing import Any, AsyncGenerator, Optional
 
-import aiohttp
+from . import http
 
 from .errors import AttachmentError, AuthError, SentinelError, UpstreamError
 from .mweb import MwebChatClient, apply_system_prompt, flatten_messages
-from .routing import cookie_jar, via
 from .sentinel import ChatRequirements, USER_AGENT as SENTINEL_UA, get_chat_requirements
 
 CREDENTIALS_FILE = os.path.join(os.path.dirname(__file__), ".chatgpt_credentials.json")
@@ -79,7 +78,7 @@ class ChatGptApiClient:
         browser_fallback: bool = False,
         mweb_fallback: bool = True,
         system_prompt: str = "",
-        session: Optional[aiohttp.ClientSession] = None,
+        session: Optional[http.Session] = None,
     ):
         self.token = token
         self.cookie = cookie
@@ -195,11 +194,11 @@ class ChatGptApiClient:
             "Referer": f"{self.BASE_URL}/",
             "Cookie": self.cookie,
         }
-        async with aiohttp.ClientSession(
-            headers=headers, cookie_jar=cookie_jar()
+        async with http.Session(
+            headers=headers
         ) as s:
-            async with s.get(via(f"{self.BASE_URL}/api/auth/session"),
-                             timeout=aiohttp.ClientTimeout(total=30)) as resp:
+            async with s.get(f"{self.BASE_URL}/api/auth/session",
+                             timeout=30) as resp:
                 text = await resp.text()
                 if resp.status != 200:
                     raise AuthError(f"session fetch failed {resp.status}: {text[:300]}")
@@ -246,15 +245,15 @@ class ChatGptApiClient:
             headers["Authorization"] = f"Bearer {self.token}"
         if self.cookie:
             headers["Cookie"] = self.cookie
-        async with aiohttp.ClientSession(
-            headers=headers, cookie_jar=cookie_jar()
+        async with http.Session(
+            headers=headers
         ) as s:
             if not self.cookie:
                 # chatgpt.com 401s the sentinel endpoints without first-party
                 # cookies - a warm-up GET collects them into the jar
                 try:
-                    async with s.get(via(f"{self.BASE_URL}/"),
-                                     timeout=aiohttp.ClientTimeout(total=30)) as warm:
+                    async with s.get(f"{self.BASE_URL}/",
+                                     timeout=30) as warm:
                         await warm.read()
                 except Exception:
                     pass
@@ -298,8 +297,8 @@ class ChatGptApiClient:
             except Exception:
                 pass
             self._session = None
-        self._session = aiohttp.ClientSession(
-            headers=self._headers(), loop=loop, cookie_jar=cookie_jar()
+        self._session = http.Session(
+            headers=self._headers(), loop=loop
         )
         self._own_session = True
         if not self.cookie:
@@ -307,7 +306,7 @@ class ChatGptApiClient:
             # its first-party cookies - a warm-up GET fills the jar
             try:
                 async with self._session.get(
-                    via(f"{self.BASE_URL}/"), timeout=aiohttp.ClientTimeout(total=30)
+                    f"{self.BASE_URL}/", timeout=30
                 ) as warm:
                     await warm.read()
             except Exception:
@@ -345,7 +344,7 @@ class ChatGptApiClient:
         try:
             await self._ensure_session()
             async with self._session.get(
-                via(f"{self.API_URL}/models"), timeout=aiohttp.ClientTimeout(total=30)
+                f"{self.API_URL}/models", timeout=30
             ) as resp:
                 if resp.status != 200:
                     return list(DEFAULT_MODELS)
@@ -370,8 +369,8 @@ class ChatGptApiClient:
         try:
             await self._ensure_session()
             async with self._session.get(
-                via(f"{self.API_URL}/conversation/{chat_id}"),
-                timeout=aiohttp.ClientTimeout(total=20),
+                f"{self.API_URL}/conversation/{chat_id}",
+                timeout=20,
             ) as resp:
                 if resp.status != 200:
                     return None
@@ -499,8 +498,8 @@ class ChatGptApiClient:
         if isinstance(source, str) and source.startswith(("http://", "https://")):
             remote_url = source
             name = name or source.rsplit("/", 1)[-1].split("?")[0] or "file"
-            async with aiohttp.ClientSession(headers={"User-Agent": USER_AGENT}) as s:
-                async with s.get(remote_url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+            async with http.Session(headers={"User-Agent": USER_AGENT}) as s:
+                async with s.get(remote_url, timeout=60) as resp:
                     if resp.status != 200:
                         raise AttachmentError(f"could not download {remote_url}: {resp.status}")
                     data = await resp.read()
@@ -532,10 +531,10 @@ class ChatGptApiClient:
         }
         await self._ensure_session()
         async with self._session.post(
-            via(f"{self.API_URL}/files"),
+            f"{self.API_URL}/files",
             data=json.dumps(meta, separators=(",", ":")),
             headers={"Content-Type": "application/json", "Accept": "application/json"},
-            timeout=aiohttp.ClientTimeout(total=60),
+            timeout=60,
         ) as resp:
             text = await resp.text()
             if resp.status in (401, 403):
@@ -559,10 +558,10 @@ class ChatGptApiClient:
             or ""
         )
         if upload_url and data is not None:
-            async with aiohttp.ClientSession(headers={"User-Agent": USER_AGENT}) as s:
+            async with http.Session(headers={"User-Agent": USER_AGENT}) as s:
                 async with s.put(
                     upload_url, data=data, headers={"Content-Type": mime},
-                    timeout=aiohttp.ClientTimeout(total=120),
+                    timeout=120,
                 ) as up:
                     if up.status >= 400:
                         raise AttachmentError(f"attachment transfer failed {up.status}")
@@ -688,7 +687,7 @@ class ChatGptApiClient:
 
     async def _iter_frames(self, resp) -> AsyncGenerator[dict, None]:
         buffer = ""
-        async for raw in resp.content:
+        async for raw in resp.iter_any():
             buffer += raw.decode("utf-8", errors="ignore")
             while "\n" in buffer:
                 line, buffer = buffer.split("\n", 1)
@@ -730,10 +729,11 @@ class ChatGptApiClient:
         done = False
 
         async with self._session.post(
-            via(url),
+            url,
             data=body,
             headers=headers,
-            timeout=aiohttp.ClientTimeout(total=timeout),
+            timeout=timeout,
+            stream=True,
         ) as resp:
             if resp.status != 200:
                 err = await resp.text()

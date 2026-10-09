@@ -32,10 +32,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
 
-import aiohttp
-
+from . import http
 from .errors import TurnstileRequiredError, UpstreamError
-from .routing import via
 
 REQUIREMENTS_PREFIX = "gAAAAAC"   # fingerprint blob
 PROOF_PREFIX = "gAAAAAB"          # proof-of-work answer
@@ -197,7 +195,7 @@ class ChatRequirements:
 
 
 async def get_chat_requirements(
-    session: aiohttp.ClientSession,
+    session: http.Session,
     *,
     profile: Optional[BrowserProfile] = None,
     turnstile_token: str = "",
@@ -211,12 +209,11 @@ async def get_chat_requirements(
     """
     profile = profile or BrowserProfile()
     blob = build_requirements_blob(profile)
-    ct = aiohttp.ClientTimeout(total=timeout)
 
     async with session.post(
-        via(f"{API_URL}/sentinel/chat-requirements/prepare"),
+        f"{API_URL}/sentinel/chat-requirements/prepare",
         data=json.dumps({"p": blob}, separators=(",", ":")),
-        timeout=ct,
+        timeout=timeout,
     ) as resp:
         text = await resp.text()
         if resp.status != 200:
@@ -254,9 +251,9 @@ async def get_chat_requirements(
         )
 
     async with session.post(
-        via(f"{API_URL}/sentinel/chat-requirements/finalize"),
+        f"{API_URL}/sentinel/chat-requirements/finalize",
         data=json.dumps(body, separators=(",", ":")),
-        timeout=ct,
+        timeout=timeout,
     ) as resp:
         text = await resp.text()
         if resp.status != 200:

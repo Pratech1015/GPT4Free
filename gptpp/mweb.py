@@ -31,11 +31,8 @@ import time
 import uuid
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 
-import aiohttp
-from yarl import URL
-
+from . import http
 from .errors import AuthError, TurnstileRequiredError, UpstreamError
-from .routing import base as relay_base, cookie_jar, via
 from .sentinel import (
     BASE_URL,
     MAX_POW_ATTEMPTS,
@@ -855,7 +852,7 @@ class MwebChatClient:
 
     def __init__(
         self,
-        session: Optional[aiohttp.ClientSession] = None,
+        session: Optional[http.Session] = None,
         profile: Optional[BrowserProfile] = None,
         system_prompt: str = "",
     ):
@@ -884,14 +881,13 @@ class MwebChatClient:
     # ------------------------------------------------------------------
     async def open(self) -> "MwebChatClient":
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(
+            self._session = http.Session(
                 headers={
                     "User-Agent": USER_AGENT,
                     "Accept-Language": "en-US,en;q=0.9",
                     "Origin": BASE_URL,
                     "Referer": f"{BASE_URL}/",
                 },
-                cookie_jar=cookie_jar(),
             )
             self._own_session = True
         await self._refresh_document()
@@ -913,7 +909,7 @@ class MwebChatClient:
             return
         try:
             async with self._session.get(
-                via(f"{BASE_URL}/"),
+                f"{BASE_URL}/",
                 headers={
                     "Accept": (
                         "text/html,application/xhtml+xml,"
@@ -924,12 +920,12 @@ class MwebChatClient:
                     "Sec-Fetch-Site": "none",
                     "Upgrade-Insecure-Requests": "1",
                 },
-                timeout=aiohttp.ClientTimeout(total=30),
+                timeout=30,
             ) as resp:
                 if resp.status != 200:
                     return
                 text = await resp.text()
-        except aiohttp.ClientError:
+        except http.ClientError:
             return
         m = _AFFINITY_RE.search(text)
         if m:
@@ -954,17 +950,14 @@ class MwebChatClient:
         return out
 
     async def _ensure_mweb_cookies(self) -> None:
-        jar = self._session.cookie_jar
-        have = set(jar.filter_cookies(f"{relay_base()}/"))
-        extra = {}
+        jar = self._session.cookies
+        have = jar.get_dict()
         if "oai-mweb-route" not in have:
-            extra["oai-mweb-route"] = "1"
+            jar.set("oai-mweb-route", "1", domain="chatgpt.com", path="/")
         if "oai-mweb-origin" not in have:
-            extra["oai-mweb-origin"] = "1"
+            jar.set("oai-mweb-origin", "1", domain="chatgpt.com", path="/")
         if "oai-did" not in have:
-            extra["oai-did"] = str(uuid.uuid4())
-        if extra:
-            jar.update_cookies(extra, URL(f"{relay_base()}/"))
+            jar.set("oai-did", str(uuid.uuid4()), domain="chatgpt.com", path="/")
 
     async def close(self) -> None:
         if self._own_session and self._session and not self._session.closed:
@@ -1030,7 +1023,7 @@ class MwebChatClient:
     # ------------------------------------------------------------------
     # transport helpers
     # ------------------------------------------------------------------
-    async def _require_session(self) -> aiohttp.ClientSession:
+    async def _require_session(self) -> http.Session:
         if self._session is None or self._session.closed:
             await self.open()
         return self._session
@@ -1048,10 +1041,10 @@ class MwebChatClient:
     async def _post_json(self, url: str, payload: dict, referer: str, timeout: float = 60) -> dict:
         session = await self._require_session()
         async with session.post(
-            via(url),
+            url,
             data=json.dumps(payload, separators=(",", ":")),
             headers=self._headers(referer, "application/json", JSON_CT),
-            timeout=aiohttp.ClientTimeout(total=timeout),
+            timeout=timeout,
         ) as resp:
             text = await resp.text()
             if resp.status != 200:
@@ -1144,10 +1137,10 @@ class MwebChatClient:
             }
         )
         async with session.post(
-            via(f"{PREPARE_URL}?lightweight_authenticated=0"),
+            f"{PREPARE_URL}?lightweight_authenticated=0",
             data=form,
             headers=headers,
-            timeout=aiohttp.ClientTimeout(total=60),
+            timeout=60,
         ) as resp:
             text = await resp.text()
             if resp.status != 200:
@@ -1236,10 +1229,11 @@ class MwebChatClient:
         stream_error: Optional[str] = None
 
         async with session.post(
-            via(url),
+            url,
             data=form,
             headers=headers,
-            timeout=aiohttp.ClientTimeout(total=timeout),
+            timeout=timeout,
+            stream=True,
         ) as resp:
             if resp.status != 200:
                 body = await resp.text()
@@ -1268,7 +1262,7 @@ class MwebChatClient:
             )
             self._parser = parser
             finished = False
-            async for raw in resp.content.iter_any():
+            async for raw in resp.iter_any():
                 if not raw:
                     continue
                 for event in parser.feed(decoder.decode(raw)):
