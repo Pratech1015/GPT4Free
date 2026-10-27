@@ -196,6 +196,82 @@ def apply_system_prompt(text: str, system_prompt: str) -> str:
     return f"{SYSTEM_PREFIX} {prompt}\n\n{text}"
 
 
+_PROMPT_MAX_CHARS = 110_000
+_PROMPT_MAX_BYTES = 110_000
+_PROMPT_MAX_TOKENS = 19_000
+_TRUNC_MARKER = "[... earlier conversation omitted to fit the prompt limit ...]"
+_ENCODER = None
+_ENCODER_TRIED = False
+
+
+def _encoder():
+    """o200k tokenizer, loaded once; None (checks skipped) when unavailable."""
+    global _ENCODER, _ENCODER_TRIED
+    if not _ENCODER_TRIED:
+        _ENCODER_TRIED = True
+        try:
+            import tiktoken
+            _ENCODER = tiktoken.get_encoding("o200k_base")
+        except Exception:
+            _ENCODER = None
+    return _ENCODER
+
+
+def _fits_prompt(text: str) -> bool:
+    if len(text) > _PROMPT_MAX_CHARS or len(text.encode()) > _PROMPT_MAX_BYTES:
+        return False
+    enc = _encoder()
+    if enc is not None and len(enc.encode(text)) > _PROMPT_MAX_TOKENS:
+        return False
+    return True
+
+
+def _cap_parts(header: str, body: str) -> str:
+    """
+    Assemble `header` + `body` within the size `conversation/updates` takes.
+
+    Oversized prompts come back as `source_submission_unavailable` (413) -
+    upstream caps a submission near 122k characters / ~22k tokens; the
+    header is kept intact (shrunk only when it alone cannot fit) and the
+    newest transcript content wins when history has to be dropped.
+    """
+    def join(*parts: str) -> str:
+        return "\n\n".join(p for p in parts if p)
+
+    text = join(header, body).strip()
+    if not text:
+        return "Hello"
+    if _fits_prompt(text):
+        return text
+    head = header
+    while head and not _fits_prompt(join(head, _TRUNC_MARKER)):
+        head = head[: len(head) // 2]
+    if not _fits_prompt(join(head, _TRUNC_MARKER)):
+        return text[:_PROMPT_MAX_CHARS].encode()[:_PROMPT_MAX_BYTES].decode(
+            errors="ignore"
+        )
+    lo, hi = 0, len(body)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if _fits_prompt(join(head, _TRUNC_MARKER, body[-mid:])):
+            lo = mid
+        else:
+            hi = mid - 1
+    return join(head, _TRUNC_MARKER, body[-lo:]) or "Hello"
+
+
+def cap_prompt(text: str) -> str:
+    """Size-cap an already-assembled prompt (see `_cap_parts`)."""
+    if _fits_prompt(text):
+        return text
+    if text.startswith(SYSTEM_PREFIX):
+        head, sep, body = text.partition("\n\n")
+        if sep:
+            return _cap_parts(head, body)
+        return _cap_parts(text, "")
+    return _cap_parts("", text)
+
+
 def flatten_messages(messages: list, system_prompt: str = "") -> str:
     """
     Transcript-style prompt for a brand-new conversation.
@@ -216,13 +292,10 @@ def flatten_messages(messages: list, system_prompt: str = "") -> str:
         else:
             label = "User" if role == "user" else "Assistant"
             chunks.append(f"{label}: {text}")
-    out = ""
     header = "\n".join(system_bits) or (system_prompt or "").strip()
-    if header:
-        out = f"{SYSTEM_PREFIX} {header}\n\n"
-    if chunks:
-        out += "\n".join(chunks) + "\n\nAssistant:"
-    return out.strip() or "Hello"
+    full = f"{SYSTEM_PREFIX} {header}" if header else ""
+    body = ("\n".join(chunks) + "\n\nAssistant:") if chunks else ""
+    return _cap_parts(full, body)
 
 
 def strip_markup(fragment: str) -> str:
@@ -1222,6 +1295,7 @@ class MwebChatClient:
     async def _stream_prompt(
         self, prompt: str, timeout: float = 180, _attempt: int = 0
     ) -> AsyncGenerator[dict, None]:
+        prompt = cap_prompt(prompt)
         session = await self._require_session()
         referer = (
             f"{BASE_URL}/uc/{self._conversation_id}"

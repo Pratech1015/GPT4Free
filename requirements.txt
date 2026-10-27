@@ -1,2 +1,3 @@
 curl_cffi>=0.16
 playwright>=1.40
+tiktoken>=0.7
