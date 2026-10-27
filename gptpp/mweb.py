@@ -683,6 +683,25 @@ class DpuParser:
         return "".join(out)
 
 
+def _diagnostic_summary(body: str) -> str:
+    """Pull `diagnostic` events (kind + full payload) out of an NDJSON body."""
+    found: List[str] = []
+    for line in body.splitlines():
+        line = line.strip()
+        if not line or '"diagnostic"' not in line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict) or event.get("type") != "diagnostic":
+            continue
+        kind = event.get("kind") or "diagnostic"
+        payload = event.get("payload")
+        found.append(f"{kind}: {payload}" if payload else str(kind))
+    return "; ".join(found)
+
+
 class SourceNdjsonParser:
     """
     Incremental parser for `application/vnd.openai.conversation-source+ndjson`.
@@ -753,7 +772,23 @@ class SourceNdjsonParser:
         if kind == "end":
             self.terminated = True
             return [{"kind": "done"}]
-        if kind in ("error", "diagnostic"):
+        if kind == "diagnostic":
+            name = str(event.get("kind") or "diagnostic")
+            payload = event.get("payload") or ""
+            if name == "source_submission_unavailable":
+                # the submission was rejected mid-stream (HTTP 200 body)
+                self.failure = {
+                    "reason": name,
+                    "status": "400",
+                    "payload": str(payload),
+                }
+                return [{
+                    "kind": "error",
+                    "message": f"conversation update failed: {name} ({payload})",
+                    "failure": dict(self.failure),
+                }]
+            return [{"kind": "control", "name": name, "attrs": {}}]
+        if kind == "error":
             detail = event.get("detail") or {}
             message = (
                 event.get("message")
@@ -761,8 +796,6 @@ class SourceNdjsonParser:
                 or event.get("detailText")
                 or "stream error"
             )
-            if kind == "diagnostic":
-                return [{"kind": "control", "name": str(message), "attrs": {}}]
             self.failure = {"reason": str(message), "status": ""}
             return [{
                 "kind": "error",
@@ -776,6 +809,20 @@ class SourceNdjsonParser:
         markdown = event.get("markdown")
         if not isinstance(markdown, str):
             markdown = ""
+        if not markdown:
+            # DIL-rendered turns leave `markdown` empty and carry the full
+            # rendered text only as a fallback snapshot
+            dil = event.get("dil")
+            fallback = event.get("fallbackMarkdown")
+            if not isinstance(fallback, str) and isinstance(dil, dict):
+                fallback = dil.get("fallbackMarkdown")
+            if isinstance(fallback, str) and fallback:
+                if message_id:
+                    self._texts[message_id] = fallback
+                    self.message_id = message_id
+                full = self.answer
+                delta, self.emitted = _walk_emitted(self.emitted, full)
+                return [{"kind": "delta", "delta": delta}] if delta else []
         if message_id and message_id not in self._texts:
             self._texts[message_id] = ""
         if event.get("mode") == "append" and message_id:
@@ -1237,6 +1284,21 @@ class MwebChatClient:
         ) as resp:
             if resp.status != 200:
                 body = await resp.text()
+                if (
+                    resp.status == 400
+                    and "source_submission_unavailable" in body
+                    and _attempt == 0
+                ):
+                    # the conversation holds a pending turn the server
+                    # cannot recover (a dropped stream earlier) - start a
+                    # clean conversation and resubmit once
+                    self.new_conversation()
+                    await self._refresh_document()
+                    async for event in self._stream_prompt(
+                        prompt, timeout, _attempt=1
+                    ):
+                        yield event
+                    return
                 stale_document = resp.status == 409 or (
                     resp.status == 403 and "affinity" in body.lower()
                 )
@@ -1250,7 +1312,8 @@ class MwebChatClient:
                 if resp.status in (401, 403):
                     raise AuthError(f"conversation updates rejected ({resp.status}): {body[:300]}")
                 raise UpstreamError(
-                    f"conversation updates failed {resp.status}: {body[:400]}",
+                    f"conversation updates failed {resp.status}: "
+                    f"{_diagnostic_summary(body) or body[:400]}",
                     status=resp.status,
                     body=body,
                 )
