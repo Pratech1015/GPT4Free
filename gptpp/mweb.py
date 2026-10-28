@@ -331,6 +331,23 @@ def _tidy_prose(text: str) -> str:
     return _SOURCES_HEADING_RE.sub("", text).rstrip()
 
 
+# markdown punctuation escapes (`\!` `\[` `\:` ...) emitted by the model
+_MD_ESCAPE_RE = re.compile(
+    r"\\([!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~])"
+)
+_MD_CODE_SPLIT_RE = re.compile(r"(```[\s\S]*?```|`[^`\n]+`)")
+
+
+def _unescape_markdown(text: str) -> str:
+    """Drop markdown punctuation escapes outside code fences/spans."""
+    if "\\" not in text:
+        return text
+    parts = _MD_CODE_SPLIT_RE.split(text)
+    for i in range(0, len(parts), 2):
+        parts[i] = _MD_ESCAPE_RE.sub(r"\1", parts[i])
+    return "".join(parts)
+
+
 def extract_assistant_text(content: str) -> str:
     """
     Pull assistant *prose* out of one DPU frame.
@@ -811,7 +828,7 @@ class SourceNdjsonParser:
         if not self._texts:
             return ""
         last = next(reversed(self._texts))
-        return self._texts[last]
+        return _unescape_markdown(self._texts[last])
 
     def feed(self, data: str) -> list[dict]:
         self.buffer += data
@@ -844,7 +861,7 @@ class SourceNdjsonParser:
             return self._control(event)
         if kind == "end":
             self.terminated = True
-            return [{"kind": "done"}]
+            return self._flush_tail() + [{"kind": "done"}]
         if kind == "diagnostic":
             name = str(event.get("kind") or "diagnostic")
             payload = event.get("payload") or ""
@@ -893,9 +910,7 @@ class SourceNdjsonParser:
                 if message_id:
                     self._texts[message_id] = fallback
                     self.message_id = message_id
-                full = self.answer
-                delta, self.emitted = _walk_emitted(self.emitted, full)
-                return [{"kind": "delta", "delta": delta}] if delta else []
+                return self._delta_events()
         if message_id and message_id not in self._texts:
             self._texts[message_id] = ""
         if event.get("mode") == "append" and message_id:
@@ -904,10 +919,25 @@ class SourceNdjsonParser:
             self._texts[message_id] = markdown
         if message_id:
             self.message_id = message_id
+        return self._delta_events()
+
+    def _delta_events(self) -> list[dict]:
         full = self.answer
         delta, self.emitted = _walk_emitted(self.emitted, full)
-        if delta:
-            return [{"kind": "delta", "delta": delta}]
+        # a trailing lone backslash may still turn into a markdown escape
+        # (`\!`) that _unescape_markdown consumes - hold it back so the
+        # delta stream never shows the pre-unescape form
+        if delta.endswith("\\"):
+            delta = delta[:-1]
+            self.emitted = full[:-1]
+        return [{"kind": "delta", "delta": delta}] if delta else []
+
+    def _flush_tail(self) -> list[dict]:
+        full = self.answer
+        if len(full) > len(self.emitted) and full.startswith(self.emitted):
+            rest = full[len(self.emitted):]
+            self.emitted = full
+            return [{"kind": "delta", "delta": rest}]
         return []
 
     def _shared(self, html: str) -> list[dict]:
@@ -933,6 +963,7 @@ class SourceNdjsonParser:
                 "failure": dict(self.failure),
             })
         elif self.done:
+            events.extend(self._flush_tail())
             events.append({"kind": "done"})
         return events
 
@@ -964,7 +995,8 @@ class SourceNdjsonParser:
             if name in ("terminal-received", "complete"):
                 self.done = self.done or name == "complete"
         self.controls.append(name)
-        return [{"kind": "control", "name": name, "attrs": dict(detail)}]
+        tail = self._flush_tail() if self.terminated or self.done else []
+        return tail + [{"kind": "control", "name": name, "attrs": dict(detail)}]
 
 
 class MwebChatClient:
